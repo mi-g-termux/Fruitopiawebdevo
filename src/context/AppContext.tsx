@@ -564,7 +564,7 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
         const username = localStorage.getItem('qf_admin_username');
         if (session?.token && session?.expiresAt && Date.now() < session.expiresAt && username) {
           const adminEmail = username + '@fruitopia-admin.internal';
-          const stablePassword = 'ftp_' + btoa(adminEmail).replace(/[^a-zA-Z0-9]/g, '') + '_auth';
+          const stablePassword = 'FruitopiaAdm1n_' + username.trim().toLowerCase().replace(/[^a-z0-9]/g, '') + '_secure2024';
           await signInWithEmailAndPassword(currentAuth, adminEmail, stablePassword).catch((e) => {
             console.warn('[Auth] Silent re-auth failed:', e?.code);
             // Session is stale — clear it so admin gets redirected to login
@@ -1237,11 +1237,11 @@ setProducts([...products]);
    * C2 LOGOUT: fbSignOut clears the Firebase Auth token server-side before
    * the local session is cleared.
    */
-  const setAdminLoggedIn = (
+  const setAdminLoggedIn = async (
     loggedIn: boolean,
     username?: string,
     password?: string,
-  ) => {
+  ): Promise<void> => {
     if (loggedIn) {
       // ── Persist local session ──────────────────────────────────────────
       setIsAdminLoggedIn(true);
@@ -1250,65 +1250,57 @@ setProducts([...products]);
         expiresAt: Date.now() + 24 * 60 * 60 * 1000,
       };
       try { localStorage.setItem('qf_admin_session', JSON.stringify(session)); } catch {}
-      // Store username so we can silently re-auth Firebase on page refresh
       if (username) { try { localStorage.setItem('qf_admin_username', username.trim()); } catch {} }
 
-      // ── C1: Firebase Auth sign-in (best-effort, non-blocking) ──────────
+      // ── C1: Firebase Auth sign-in — AWAITED so token is ready before panel opens ──
       if (username && password && auth) {
         const adminEmail = username.trim() + '@fruitopia-admin.internal';
+        // Fixed stable password — consistent formula, no btoa encoding issues
+        const stablePassword = 'FruitopiaAdm1n_' + username.trim().toLowerCase().replace(/[^a-z0-9]/g, '') + '_secure2024';
 
-        // Stable password derived from username only — never changes when the
-        // admin updates their local password, so Firebase Auth stays in sync.
-        const stablePassword = 'ftp_' + btoa(adminEmail).replace(/[^a-zA-Z0-9]/g, '') + '_auth';
+        try {
+          // ── Path 1: happy path ─────────────────────────────────────
+          await signInWithEmailAndPassword(auth, adminEmail, stablePassword);
+          console.log('[Auth] Firebase Auth sign-in successful.');
+        } catch (e1: any) {
 
-        (async () => {
-          try {
-            // ── Path 1: happy path ─────────────────────────────────────
-            await signInWithEmailAndPassword(auth, adminEmail, stablePassword);
-          } catch (e1: any) {
-
-            if (e1?.code === 'auth/user-not-found' || e1?.code === 'auth/invalid-credential') {
-              // ── Path 2: first login ever — create the Firebase Auth user ──
-              try {
-                await createUserWithEmailAndPassword(auth, adminEmail, stablePassword);
-              } catch (e2: any) {
-                console.warn('[Auth] Firebase Auth user creation failed:', e2?.code ?? e2);
-              }
-
-            } else if (e1?.code === 'auth/wrong-password') {
-              // ── Path 3: migration — user was created with the raw admin
-              //    password (old behaviour). Sign in with that, then
-              //    immediately update to the stable password so future
-              //    logins take Path 1.  ─────────────────────────────────
-              try {
-                const cred = await signInWithEmailAndPassword(auth, adminEmail, password);
-                await updatePassword(cred.user, stablePassword);
-              } catch (e3: any) {
-                console.warn(
-                  '[Auth] Firebase Auth migration failed — Firestore writes may be rejected.',
-                  'code:', e3?.code ?? e3,
-                );
-              }
-
-            } else {
-              // ── Path 4: unexpected error ───────────────────────────────
-              console.warn(
-                '[Auth] Firebase Auth sign-in failed — Firestore writes will be rejected ' +
-                'until this is resolved. Error:', e1?.code ?? e1,
-              );
+          if (e1?.code === 'auth/user-not-found' || e1?.code === 'auth/invalid-credential') {
+            // ── Path 2: first login ever — create the Firebase Auth user ──
+            try {
+              await createUserWithEmailAndPassword(auth, adminEmail, stablePassword);
+              console.log('[Auth] Firebase Auth user created successfully.');
+            } catch (e2: any) {
+              console.warn('[Auth] Firebase Auth user creation failed:', e2?.code ?? e2);
             }
+
+          } else if (e1?.code === 'auth/wrong-password') {
+            // ── Path 3: migration from old btoa-derived stable password ──
+            const oldStablePassword = 'ftp_' + btoa(adminEmail).replace(/[^a-zA-Z0-9]/g, '') + '_auth';
+            try {
+              const cred = await signInWithEmailAndPassword(auth, adminEmail, oldStablePassword);
+              await updatePassword(cred.user, stablePassword);
+              console.log('[Auth] Firebase Auth migrated to new stable password.');
+            } catch {
+              try {
+                const cred2 = await signInWithEmailAndPassword(auth, adminEmail, password);
+                await updatePassword(cred2.user, stablePassword);
+                console.log('[Auth] Firebase Auth migrated from raw password.');
+              } catch (e3: any) {
+                console.warn('[Auth] Firebase Auth migration failed:', e3?.code ?? e3);
+              }
+            }
+
+          } else {
+            // ── Path 4: unexpected error ───────────────────────────────
+            console.warn('[Auth] Firebase Auth sign-in failed — Firestore writes will be rejected. Error:', e1?.code ?? e1);
           }
-        })();
+        }
       }
     } else {
-      // ── C2: Firebase Auth sign-out (best-effort, non-blocking) ─────────
+      // ── C2: Firebase Auth sign-out — awaited for clean token clearing ───
       if (auth) {
-        (async () => {
-          try { await fbSignOut(auth); } catch { /* silent */ }
-        })();
+        try { await fbSignOut(auth); } catch { /* silent */ }
       }
-
-      // ── Clear local session ────────────────────────────────────────────
       setIsAdminLoggedIn(false);
       try { localStorage.removeItem('qf_admin_session'); } catch {}
       try { localStorage.removeItem('qf_admin_username'); } catch {}

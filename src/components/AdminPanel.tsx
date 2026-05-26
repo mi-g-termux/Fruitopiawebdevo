@@ -25,6 +25,7 @@ import {
  Shield,
  KeyRound,
  Eye,
+ EyeOff,
  Check,
  Phone,
  RefreshCw,
@@ -87,6 +88,9 @@ export const AdminPanel: React.FC = () => {
  // Route Login input
  const [usernameInput, setUsernameInput] = useState('');
  const [passwordInput, setPasswordInput] = useState('');
+ const [showLoginPassword, setShowLoginPassword] = useState(false);
+ const [showSecPass, setShowSecPass] = useState(false);
+ const [showCurrentPass, setShowCurrentPass] = useState(false);
  const [loginError, setLoginError] = useState('');
  const [loginSuccess, setLoginSuccess] = useState('');
 
@@ -1109,14 +1113,26 @@ await saveSiteSettings(JSON.parse(JSON.stringify(current)));
  onChange={(e) => setUsernameInput(e.target.value)}
  placeholder="Enter admin username"
  className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-sm font-semibold text-white placeholder-white/30 outline-none focus:bg-white/20 focus:border-emerald-400/70 transition-all"
- /> </div> <div> <label className="block text-[10px] font-bold uppercase text-white/50 mb-1.5 tracking-wider">Password</label> <input
- type="password"
- required
- value={passwordInput}
- onChange={(e) => setPasswordInput(e.target.value)}
- placeholder="••••••••••••"
- className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-sm font-semibold text-white placeholder-white/40 outline-none focus:bg-white/20 focus:border-emerald-400/70 transition-all"
- /> </div> <div className="pt-1"> <button
+ /> </div> <div> <label className="block text-[10px] font-bold uppercase text-white/50 mb-1.5 tracking-wider">Password</label>
+   <div className="relative">
+     <input
+       type={showLoginPassword ? 'text' : 'password'}
+       required
+       value={passwordInput}
+       onChange={(e) => setPasswordInput(e.target.value)}
+       placeholder="••••••••••••"
+       className="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 pr-12 text-sm font-semibold text-white placeholder-white/40 outline-none focus:bg-white/20 focus:border-emerald-400/70 transition-all"
+     />
+     <button
+       type="button"
+       onClick={() => setShowLoginPassword(p => !p)}
+       className="absolute right-3 top-1/2 -translate-y-1/2 text-white/50 hover:text-white/90 transition-colors"
+       tabIndex={-1}
+     >
+       {showLoginPassword ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+     </button>
+   </div>
+ </div> <div className="pt-1"> <button
  type="submit"
  className="w-full cursor-pointer py-3.5 font-black uppercase text-sm tracking-wider transition-all rounded-xl shadow-lg text-white flex items-center justify-center gap-2"
  style={{ background: loginLoading ? '#6b7280' : 'linear-gradient(135deg, #10b981, #059669)', cursor: loginLoading ? 'wait' : 'pointer' }}
@@ -2385,17 +2401,66 @@ await saveSiteSettings(JSON.parse(JSON.stringify(current)));
 
  {/* SECTION: SECURITY & CREDENTIALS UPDATES */}
  {settingsSection ==='security' && (
- <div className="space-y-4"> <h4 className="text-xs font-bold uppercase text-slate-400"> RE-KEY CREDENTIALS KEYS</h4> <div className="grid grid-cols-1 md:grid-cols-2 gap-4"> <div> <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">New Administrator Username</label> <input
- type="text"
- value={secUsername}
- onChange={(e) => setSecUsername(e.target.value)}
- className="w-full bg-slate-50 border border-slate-200 focus:border-rose-400 focus:ring-1 focus:ring-rose-400 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 transition-all outline-none"
- /> </div> <div> <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">New Administrator Password</label> <input
- type="password"
- value={secPass}
- onChange={(e) => setSecPass(e.target.value)}
- className="w-full bg-slate-50 border border-slate-200 focus:border-rose-400 focus:ring-1 focus:ring-rose-400 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-rose-600 transition-all outline-none"
- /> </div> </div> {/* Google Sign-In Configuration */}
+ <div className="space-y-4"> <h4 className="text-xs font-bold uppercase text-slate-400"> RE-KEY CREDENTIALS KEYS</h4>
+
+   {/* ── Current saved credentials (read-only) ── */}
+   <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+     <p className="text-[10px] font-bold uppercase text-slate-400 tracking-wider">Current Saved Credentials</p>
+     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+       <div>
+         <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Current Username</label>
+         <div className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-700 select-all">
+           {adminSettings.username || '—'}
+         </div>
+       </div>
+       <div>
+         <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Current Password</label>
+         <div className="relative">
+           <div className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 pr-9 text-xs font-semibold text-slate-700 select-all font-mono">
+             {showCurrentPass ? (adminSettings.password || '—') : '••••••••'}
+           </div>
+           <button
+             type="button"
+             onClick={() => setShowCurrentPass(p => !p)}
+             className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 transition-colors"
+           >
+             {showCurrentPass ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+           </button>
+         </div>
+       </div>
+     </div>
+   </div>
+
+   {/* ── Update credentials form ── */}
+   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+     <div>
+       <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">New Administrator Username</label>
+       <input
+         type="text"
+         value={secUsername}
+         onChange={(e) => setSecUsername(e.target.value)}
+         className="w-full bg-slate-50 border border-slate-200 focus:border-rose-400 focus:ring-1 focus:ring-rose-400 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 transition-all outline-none"
+       />
+     </div>
+     <div>
+       <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">New Administrator Password</label>
+       <div className="relative">
+         <input
+           type={showSecPass ? 'text' : 'password'}
+           value={secPass}
+           onChange={(e) => setSecPass(e.target.value)}
+           className="w-full bg-slate-50 border border-slate-200 focus:border-rose-400 focus:ring-1 focus:ring-rose-400 rounded-lg px-2.5 py-1.5 pr-9 text-xs font-semibold text-rose-600 transition-all outline-none"
+         />
+         <button
+           type="button"
+           onClick={() => setShowSecPass(p => !p)}
+           className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 transition-colors"
+         >
+           {showSecPass ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+         </button>
+       </div>
+     </div>
+   </div> {/* Google Sign-In Configuration */}
  <div className="pt-4 border-t border-slate-100"> <h4 className="text-xs font-bold uppercase text-slate-400 mb-3"> Google Sign-In</h4> <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2.5 mb-3 text-[10px] text-blue-700 font-medium leading-relaxed"> <strong>Setup:</strong> Go to{''}
  <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer" className="underline font-bold">Google Cloud Console</a> {''}→ APIs &amp; Services → Credentials → Create OAuth 2.0 Client ID. Set the <strong>Authorized JavaScript origins</strong> to your site domain and paste the Client ID below.
  </div> <div className="flex items-center gap-3 mb-3"> <label className="flex items-center gap-2 cursor-pointer select-none"> <div

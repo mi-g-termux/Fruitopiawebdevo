@@ -865,19 +865,34 @@ export const dbService = {
     // Firestore is the ONLY source of truth for admin credentials.
     // No localStorage read — credentials must be consistent across all devices.
     if (sbOk()) {
-      const v = await sbGetSetting<AdminCredentials>('adminSettings');
-      if (v?.username && v?.password) { store.adminSettings = v; return v; }
+      try {
+        const v = await sbGetSetting<AdminCredentials>('adminSettings');
+        if (v?.username && v?.password) { store.adminSettings = v; return v; }
+      } catch (err) {
+        console.warn('[db] Supabase getAdminSettings failed, trying Firebase:', err);
+      }
     }
     if (fbOk()) {
-      // throws on network/permission error — caller must handle and show UI error
-      const snap = await getDoc(doc(getDb()!, 'settings', 'adminSettings'));
-      if (snap.exists()) {
-        const v = snap.data() as AdminCredentials;
-        store.adminSettings = v;
-        return v;
+      try {
+        const snap = await getDoc(doc(getDb()!, 'settings', 'adminSettings'));
+        if (snap.exists()) {
+          const v = snap.data() as AdminCredentials;
+          store.adminSettings = v;
+          return v;
+        }
+        // Document missing — return in-memory value (set by installer)
+        return store.adminSettings;
+      } catch (err: any) {
+        // PERMISSION_DENIED = Firebase Auth token not ready yet.
+        // Return in-memory store so login can still proceed.
+        const code = err?.code ?? '';
+        if (code === 'permission-denied' || String(err?.message).includes('PERMISSION_DENIED')) {
+          console.warn('[db] getAdminSettings: Firestore permission denied — Firebase Auth token may not be ready. Using in-memory credentials.');
+        } else {
+          console.warn('[db] getAdminSettings: Firestore error:', err);
+        }
+        return store.adminSettings;
       }
-      // Document missing — return in-memory value (set by installer)
-      return store.adminSettings;
     }
     // Firebase not yet connected — return in-memory store (set by installer on first boot)
     return store.adminSettings;
