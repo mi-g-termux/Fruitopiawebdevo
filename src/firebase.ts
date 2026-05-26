@@ -82,60 +82,100 @@ let _activeSource:  FirebaseSource     = 'none';
  * Module-level promise that resolves to the config fetched from
  * /firebase-config.json, or null if the file is missing/invalid.
  * The IIFE runs exactly once — subsequent callers await the same promise.
+ * Includes retry logic for mobile networks.
  */
 const _fileConfigPromise: Promise<FirebaseRuntimeConfig | null> = (async () => {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4000);
+  const maxRetries = 3;
+  const retryDelays = [500, 1000, 2000]; // Progressive backoff
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
 
-    const res = await fetch('/firebase-config.json', {
-      signal: controller.signal,
-      // Bust cache so a freshly uploaded file is always picked up
-      cache: 'no-cache',
-    });
+      const res = await fetch('/firebase-config.json', {
+        signal: controller.signal,
+        // Bust cache so a freshly uploaded file is always picked up
+        cache: 'no-cache',
+        headers: { 'Accept': 'application/json' },
+      });
 
-    clearTimeout(timeout);
+      clearTimeout(timeout);
 
-    if (!res.ok) return null;
-
-    // Guard against SPA rewrites returning HTML instead of JSON.
-    // e.g. Vercel/Netlify may serve index.html for /firebase-config.json
-    // on first deploy before the file exists in the output directory.
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('application/json') && !contentType.includes('text/json')) {
-      // Peek at the body — if it starts with '<' it's HTML, not JSON
-      const text = await res.text();
-      if (text.trimStart().startsWith('<')) return null;
-      // Try parsing what we got anyway
-      try {
-        const json = JSON.parse(text);
-        if (
-          typeof json.apiKey === 'string' && json.apiKey.trim() !== '' &&
-          typeof json.projectId === 'string' && json.projectId.trim() !== ''
-        ) {
-          return json as FirebaseRuntimeConfig;
+      if (!res.ok) {
+        if (attempt < maxRetries) {
+          console.warn(`[Firebase] Config fetch failed (${res.status}), retrying...`);
+          await new Promise(r => setTimeout(r, retryDelays[attempt]));
+          continue;
         }
-      } catch {
-        // Not valid JSON
+        return null;
       }
+
+      // Guard against SPA rewrites returning HTML instead of JSON.
+      // e.g. Vercel/Netlify may serve index.html for /firebase-config.json
+      // on first deploy before the file exists in the output directory.
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json') && !contentType.includes('text/json')) {
+        // Peek at the body — if it starts with '<' it's HTML, not JSON
+        const text = await res.text();
+        if (text.trimStart().startsWith('<')) {
+          if (attempt < maxRetries) {
+            console.warn('[Firebase] Config fetch returned HTML, retrying...');
+            await new Promise(r => setTimeout(r, retryDelays[attempt]));
+            continue;
+          }
+          return null;
+        }
+        // Try parsing what we got anyway
+        try {
+          const json = JSON.parse(text);
+          if (
+            typeof json.apiKey === 'string' && json.apiKey.trim() !== '' &&
+            typeof json.projectId === 'string' && json.projectId.trim() !== ''
+          ) {
+            console.log('[Firebase] ✅ Config loaded from /firebase-config.json (HTML parsing)');
+            return json as FirebaseRuntimeConfig;
+          }
+        } catch {
+          // Not valid JSON
+        }
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, retryDelays[attempt]));
+          continue;
+        }
+        return null;
+      }
+
+      const json = await res.json();
+
+      // Validate minimum required fields
+      if (
+        typeof json.apiKey === 'string' && json.apiKey.trim() !== '' &&
+        typeof json.projectId === 'string' && json.projectId.trim() !== ''
+      ) {
+        console.log('[Firebase] ✅ Config loaded from /firebase-config.json');
+        return json as FirebaseRuntimeConfig;
+      }
+
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, retryDelays[attempt]));
+        continue;
+      }
+
+      return null;
+    } catch (err: any) {
+      // File not found, network error, or abort
+      if (attempt < maxRetries) {
+        console.warn(`[Firebase] Config fetch attempt ${attempt + 1} failed:`, err?.message);
+        await new Promise(r => setTimeout(r, retryDelays[attempt]));
+        continue;
+      }
+      console.warn('[Firebase] Config fetch failed after all retries:', err?.message);
       return null;
     }
-
-    const json = await res.json();
-
-    // Validate minimum required fields
-    if (
-      typeof json.apiKey === 'string' && json.apiKey.trim() !== '' &&
-      typeof json.projectId === 'string' && json.projectId.trim() !== ''
-    ) {
-      return json as FirebaseRuntimeConfig;
-    }
-
-    return null;
-  } catch {
-    // File not found, network error, or abort — all treated as "not available"
-    return null;
   }
+  
+  return null;
 })();
 
 // ════════════════════════════════════════════════════════════════════════════

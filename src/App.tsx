@@ -44,7 +44,7 @@ function AppContent() {
   useEffect(() => {
     let cancelled = false;
 
-  async function checkInstall() {
+  async function checkInstall(retryCount = 0) {
     await firebaseBootPromise;
     if (cancelled) return;
 
@@ -60,30 +60,50 @@ function AppContent() {
     // It persists globally across all browsers and users.
     try {
       const db = getDb();
-      if (db) {
-        const snap = await getDoc(doc(db, 'settings', 'install_status'));
-        if (cancelled) return;
-        if (snap.exists() && snap.data()?.installed === true) {
-          // Installation is complete — show the app
-          setInstallState('ready');
-          return;
+      if (!db) {
+        // Database not initialized — wait and retry
+        if (retryCount < 3) {
+          console.warn(`[checkInstall] DB not ready, retrying... (attempt ${retryCount + 1}/3)`);
+          await new Promise(r => setTimeout(r, 500));
+          if (!cancelled) return checkInstall(retryCount + 1);
         }
+        // Failed after retries — show install to be safe
+        setInstallState('install');
+        return;
       }
-    } catch (err) {
-      console.warn('[checkInstall] Firestore read failed:', err);
+
+      const snap = await getDoc(doc(db, 'settings', 'install_status'));
+      if (cancelled) return;
+      
+      if (snap.exists() && snap.data()?.installed === true) {
+        // Installation is complete — show the app
+        console.log('[checkInstall] ✅ Installation verified from Firestore');
+        setInstallState('ready');
+        return;
+      }
+    } catch (err: any) {
+      // Network error or permission denied — retry once
+      if (retryCount < 2) {
+        console.warn(`[checkInstall] Firestore read failed (${err?.code || 'unknown'}), retrying...`);
+        await new Promise(r => setTimeout(r, 1000));
+        if (!cancelled) return checkInstall(retryCount + 1);
+      }
+      
+      console.warn('[checkInstall] Firestore read failed after retries:', err);
       // On error, show install view to be safe
       setInstallState('install');
       return;
     }
 
     // Firebase is configured but installation was never completed
+    console.log('[checkInstall] Installation status not found in Firestore — showing installer');
     setInstallState('install');
   }
 
     // Expose so InstallWizard can trigger a re-check immediately after writing
     // install_status — handles the case where Firebase was already configured
     // and onFirebaseReadyChange never re-fires.
-    (window as any).__fruitopiaCheckInstall = checkInstall;
+    (window as any).__fruitopiaCheckInstall = () => checkInstall(0);
 
     checkInstall();
 

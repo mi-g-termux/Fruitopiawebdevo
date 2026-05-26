@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { probeInstallHelper, reinitializeDynamicFirebase, getDb } from '../firebase'
-import { doc, setDoc, writeBatch } from 'firebase/firestore'
+import { doc, setDoc, getDoc, writeBatch } from 'firebase/firestore'
 import {
   DEFAULT_PRODUCTS,
   DEFAULT_CATEGORIES,
@@ -210,12 +210,35 @@ function Step6Install({
         15000, 'Finalising installation'
       )
       markDone(6)
-      setInstallProgress(p => ({ ...p, status: 'done', message: 'Installation complete!' }))
+      setInstallProgress(p => ({ ...p, status: 'done', message: 'Installation complete! Verifying...' }))
+      
+      // Verify the install_status was written successfully
+      // Wait a moment for Firestore to sync globally
+      await new Promise(r => setTimeout(r, 1000))
+      
+      try {
+        const snap = await getDoc(doc(db, 'settings', 'install_status'))
+        if (snap.exists() && snap.data()?.installed === true) {
+          console.log('[InstallWizard] ✅ Install status verified in Firestore')
+          setInstallProgress(p => ({ ...p, message: 'Installation verified! Redirecting...' }))
+        } else {
+          console.warn('[InstallWizard] Warning: Install status not verified, will try re-check')
+        }
+      } catch (verifyErr) {
+        console.warn('[InstallWizard] Verification failed:', verifyErr)
+      }
+      
       setCurrentStep(7)
+      
       // Notify App.tsx to re-evaluate installState — this triggers the check to read
       // install_status from Firestore (now the global source of truth)
+      // Reset retry count to 0 for a fresh check
       if (typeof (window as any).__fruitopiaCheckInstall === 'function') {
-        setTimeout(() => (window as any).__fruitopiaCheckInstall(), 300)
+        console.log('[InstallWizard] Triggering app re-check after installation')
+        setTimeout(() => (window as any).__fruitopiaCheckInstall(), 500)
+      } else {
+        console.warn('[InstallWizard] Re-check function not available, redirecting to home')
+        setTimeout(() => { window.location.href = '/' }, 1000)
       }
     } catch (e: any) { markError(e?.message || 'Failed to finalise') }
   // eslint-disable-next-line react-hooks/exhaustive-deps
