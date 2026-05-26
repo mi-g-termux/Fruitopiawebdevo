@@ -428,7 +428,7 @@ export const AdminPanel: React.FC = () => {
  const [secUsername, setSecUsername] = useState(adminSettings.username ||'');
  const [secPass, setSecPass] = useState(adminSettings.password ||'');
 
- // Keep inputs in sync when adminSettings loads/changes (e.g. after Firestore fetch)
+ // Keep inputs in sync when adminSettings loads/changes from Firestore
  useEffect(() => {
    setSecUsername(adminSettings.username || '');
    setSecPass(adminSettings.password || '');
@@ -450,9 +450,8 @@ export const AdminPanel: React.FC = () => {
      passwordInput.trim() === liveSettings.password
    ) {
      setLoginSuccess('Access granted! Loading Store Admin...');
-     setTimeout(() => {
-       setAdminLoggedIn(true, usernameInput.trim(), passwordInput.trim());
-     }, 900);
+     // Await Firebase Auth so Firestore writes work immediately after login
+     await setAdminLoggedIn(true, usernameInput.trim(), passwordInput.trim());
    } else {
      setLoginError('Invalid credentials. Please check your username and password.');
    }
@@ -1045,7 +1044,7 @@ await saveSiteSettings(JSON.parse(JSON.stringify(current)));
    try {
      const parsed = JSON.parse(err?.message || '{}');
      if (parsed?.error?.includes('permission-denied') || parsed?.error?.includes('PERMISSION_DENIED')) {
-       msg = 'Firebase permission denied. Open Firebase Console → Firestore → Rules and allow writes to settings/adminSettings.';
+       msg = 'Firebase permission denied. Check Firestore security rules.';
      } else if (parsed?.error) {
        msg = 'Firestore: ' + parsed.error;
      }

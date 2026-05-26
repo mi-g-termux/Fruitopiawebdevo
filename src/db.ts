@@ -862,7 +862,7 @@ export const dbService = {
   // ── ADMIN SETTINGS ─────────────────────────────────────────────────────────
 
   async getAdminSettings(): Promise<AdminCredentials> {
-    // Always prefer live backend — never serve stale localStorage defaults
+    // Always prefer live backend — never blindly serve stale localStorage defaults
     if (sbOk()) {
       const v = await sbGetSetting<AdminCredentials>('adminSettings');
       if (v) { store.adminSettings = v; setLocal('qf_adminSettings', v); return v; }
@@ -878,7 +878,7 @@ export const dbService = {
         }
       } catch (err) { console.warn('[db] Firebase getAdmin fallback:', err); }
     }
-    // Only fall back to localStorage if it has REAL data (not the default admin/admin123)
+    // Only use localStorage cache if it has real (non-default) credentials
     const cached = store.adminSettings;
     if (cached && cached.username && cached.username !== DEFAULT_ADMIN_CREDENTIALS.username) {
       return cached;
@@ -890,14 +890,14 @@ export const dbService = {
   },
 
   async saveAdminSettings(settings: AdminCredentials): Promise<void> {
-    // Write to backend FIRST — if it fails, don't update local state
+    // Write to backend FIRST — if it throws, local state stays unchanged
     if (sbOk()) {
       await sbSetSetting('adminSettings', settings);
     } else if (fbOk()) {
-      // Let the error propagate — caller handles it with a proper message
+      // Allow the real Firestore error to propagate to the caller
       await setDoc(doc(getDb()!, 'settings', 'adminSettings'), settings);
     }
-    // Only update in-memory and localStorage after backend confirms success
+    // Only update local state after backend confirms success
     store.adminSettings = settings;
     setLocal('qf_adminSettings', settings);
   },

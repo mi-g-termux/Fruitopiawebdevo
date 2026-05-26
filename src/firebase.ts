@@ -592,6 +592,11 @@ export function getDb(): import('firebase/firestore').Firestore {
   return _db;
 }
 
+/** Always returns the live Auth instance — never a stale null reference */
+export function getAuth(): import('firebase/auth').Auth | null {
+  return _auth;
+}
+
 /**
  * Snapshot value — NOTE: this is read at import time and will be `false`
  * until the async boot completes. Prefer getIsFirebaseConfigured() for
