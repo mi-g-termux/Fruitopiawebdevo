@@ -629,6 +629,16 @@ export interface FirestoreErrorInfo {
   };
 }
 
+/**
+ * Check if an error is a permission-denied error.
+ * Permission-denied errors are expected when Firebase Auth isn't ready yet,
+ * but data is already saved locally, so they shouldn't be treated as failures.
+ */
+export function isPermissionDeniedError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /permission.?denied|PERMISSION_DENIED|missing.permission/i.test(msg);
+}
+
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,

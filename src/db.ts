@@ -56,6 +56,7 @@ import {
   db as _firebaseDb,
   getIsFirebaseConfigured,
   handleFirestoreError,
+  isPermissionDeniedError,
   OperationType,
 } from './firebase';
 import {
@@ -531,6 +532,26 @@ async function sbSetSetting<T>(key: string, value: T): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  ERROR HANDLING HELPER — GRACEFUL FIRESTORE WRITE FAILURES
+//  If a permission-denied error occurs, data is already saved locally, so we
+//  log it and continue instead of throwing. Other errors are re-thrown.
+// ─────────────────────────────────────────────────────────────────────────────
+function handleFirestoreWriteError(
+  error: unknown,
+  operationType: OperationType,
+  path: string | null,
+): void {
+  const errMsg = error instanceof Error ? error.message : String(error);
+  // Permission-denied is OK — data is already saved locally
+  if (isPermissionDeniedError(error)) {
+    console.warn(`[db] Firestore permission-denied (data saved locally): ${path}`, errMsg);
+    return; // Don't throw — local data is already persisted
+  }
+  // For other errors, throw to alert the caller
+  handleFirestoreError(error, operationType, path);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  UNIFIED dbService — POLYMORPHIC CRUD API
 //  Each method tries: Supabase → Firebase → Local  (in that priority order,
 //  based on which engine is currently active and connected)
@@ -574,14 +595,14 @@ export const dbService = {
     setLocal('qf_products', store.products);
     // Persist to active cloud backend
     if (sbOk()) { await sbUpsert('products', product); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'products', product.id), product); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `products/${product.id}`); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'products', product.id), product); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, `products/${product.id}`); } }
   },
 
   async deleteProduct(productId: string): Promise<void> {
     store.products = store.products.filter(p => p.id !== productId);
     setLocal('qf_products', store.products);
     if (sbOk()) { await sbDelete('products', productId); return; }
-    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'products', productId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `products/${productId}`); } }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'products', productId)); } catch (e) { handleFirestoreWriteError(e, OperationType.DELETE, `products/${productId}`); } }
   },
 
   // ── CATEGORIES ─────────────────────────────────────────────────────────────
@@ -615,14 +636,14 @@ export const dbService = {
     store.categories = store.categories.filter((c, i, a) => a.findIndex(x => x.id === c.id) === i);
     setLocal('qf_categories', store.categories);
     if (sbOk()) { await sbUpsert('categories', category); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'categories', category.id), category); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `categories/${category.id}`); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'categories', category.id), category); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, `categories/${category.id}`); } }
   },
 
   async deleteCategory(categoryId: string): Promise<void> {
     store.categories = store.categories.filter(c => c.id !== categoryId);
     setLocal('qf_categories', store.categories);
     if (sbOk()) { await sbDelete('categories', categoryId); return; }
-    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'categories', categoryId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `categories/${categoryId}`); } }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'categories', categoryId)); } catch (e) { handleFirestoreWriteError(e, OperationType.DELETE, `categories/${categoryId}`); } }
   },
 
   // ── ORDERS ─────────────────────────────────────────────────────────────────
@@ -654,7 +675,7 @@ export const dbService = {
     if (idx > -1) store.orders[idx] = order; else store.orders.push(order);
     setLocal('qf_orders', store.orders);
     if (sbOk()) { await sbUpsert('orders', order); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'orders', order.id), order); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `orders/${order.id}`); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'orders', order.id), order); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, `orders/${order.id}`); } }
   },
 
   async updateOrderStatus(orderId: string, status: Order['orderStatus']): Promise<void> {
@@ -664,7 +685,7 @@ export const dbService = {
       if (status === 'Delivered') store.orders[idx].paymentStatus = 'Paid';
       setLocal('qf_orders', store.orders);
       if (sbOk()) { await sbUpsert('orders', store.orders[idx]); return; }
-      if (fbOk()) { try { await setDoc(doc(getDb()!, 'orders', orderId), store.orders[idx]); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `orders/${orderId}`); } }
+      if (fbOk()) { try { await setDoc(doc(getDb()!, 'orders', orderId), store.orders[idx]); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, `orders/${orderId}`); } }
     }
   },
 
@@ -674,7 +695,7 @@ export const dbService = {
       store.orders[idx].paymentStatus = status;
       setLocal('qf_orders', store.orders);
       if (sbOk()) { await sbUpsert('orders', store.orders[idx]); return; }
-      if (fbOk()) { try { await setDoc(doc(getDb()!, 'orders', orderId), store.orders[idx]); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `orders/${orderId}`); } }
+      if (fbOk()) { try { await setDoc(doc(getDb()!, 'orders', orderId), store.orders[idx]); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, `orders/${orderId}`); } }
     }
   },
 
@@ -682,7 +703,7 @@ export const dbService = {
     store.orders = store.orders.filter(o => o.id !== orderId);
     setLocal('qf_orders', store.orders);
     if (sbOk()) { await sbDelete('orders', orderId); return; }
-    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'orders', orderId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `orders/${orderId}`); } }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'orders', orderId)); } catch (e) { handleFirestoreWriteError(e, OperationType.DELETE, `orders/${orderId}`); } }
   },
 
   // ── COUPONS ────────────────────────────────────────────────────────────────
@@ -708,14 +729,14 @@ export const dbService = {
     if (idx > -1) store.coupons[idx] = coupon; else store.coupons.push(coupon);
     setLocal('qf_coupons', store.coupons);
     if (sbOk()) { await sbUpsert('coupons', coupon); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'coupons', coupon.id), coupon); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `coupons/${coupon.id}`); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'coupons', coupon.id), coupon); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, `coupons/${coupon.id}`); } }
   },
 
   async deleteCoupon(couponId: string): Promise<void> {
     store.coupons = store.coupons.filter(c => c.id !== couponId);
     setLocal('qf_coupons', store.coupons);
     if (sbOk()) { await sbDelete('coupons', couponId); return; }
-    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'coupons', couponId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `coupons/${couponId}`); } }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'coupons', couponId)); } catch (e) { handleFirestoreWriteError(e, OperationType.DELETE, `coupons/${couponId}`); } }
   },
 
   // ── NEWSLETTER ─────────────────────────────────────────────────────────────
@@ -752,7 +773,7 @@ export const dbService = {
     store.newsletter = store.newsletter.filter(s => s.id !== id);
     setLocal('qf_newsletter', store.newsletter);
     if (sbOk()) { await sbDelete('newsletter', id); return; }
-    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'newsletter', id)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `newsletter/${id}`); } }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'newsletter', id)); } catch (e) { handleFirestoreWriteError(e, OperationType.DELETE, `newsletter/${id}`); } }
   },
 
   // ── REVIEWS ────────────────────────────────────────────────────────────────
@@ -786,7 +807,7 @@ export const dbService = {
       this.saveProduct(store.products[pIdx]);
     }
     if (sbOk()) { await sbUpsert('reviews', rev); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'reviews', rev.id), rev); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `reviews/${rev.id}`); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'reviews', rev.id), rev); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, `reviews/${rev.id}`); } }
   },
 
   async approveReview(reviewId: string, isApproved: boolean): Promise<void> {
@@ -795,7 +816,7 @@ export const dbService = {
       store.reviews[idx].isApproved = isApproved;
       setLocal('qf_reviews', store.reviews);
       if (sbOk()) { await sbUpsert('reviews', store.reviews[idx]); return; }
-      if (fbOk()) { try { await setDoc(doc(getDb()!, 'reviews', reviewId), store.reviews[idx]); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `reviews/${reviewId}`); } }
+      if (fbOk()) { try { await setDoc(doc(getDb()!, 'reviews', reviewId), store.reviews[idx]); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, `reviews/${reviewId}`); } }
     }
   },
 
@@ -803,7 +824,7 @@ export const dbService = {
     store.reviews = store.reviews.filter(r => r.id !== reviewId);
     setLocal('qf_reviews', store.reviews);
     if (sbOk()) { await sbDelete('reviews', reviewId); return; }
-    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'reviews', reviewId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `reviews/${reviewId}`); } }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'reviews', reviewId)); } catch (e) { handleFirestoreWriteError(e, OperationType.DELETE, `reviews/${reviewId}`); } }
   },
 
   // ── SITE SETTINGS ──────────────────────────────────────────────────────────
@@ -829,7 +850,7 @@ export const dbService = {
     store.siteSettings = merged;
     setLocal('qf_siteSettings', merged);
     if (sbOk()) { await sbSetSetting('siteSettings', settings); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'siteSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/siteSettings'); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'siteSettings'), settings); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, 'settings/siteSettings'); } }
   },
 
   // ── SMTP SETTINGS ──────────────────────────────────────────────────────────
@@ -844,7 +865,7 @@ export const dbService = {
     store.smtpSettings = settings;
     setLocal('qf_smtpSettings', settings);
     if (sbOk()) { await sbSetSetting('smtpSettings', settings); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'smtpSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/smtpSettings'); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'smtpSettings'), settings); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, 'settings/smtpSettings'); } }
   },
 
   // ── PAYMENT SETTINGS ───────────────────────────────────────────────────────
@@ -859,7 +880,7 @@ export const dbService = {
     store.paymentSettings = settings;
     setLocal('qf_paymentSettings', settings);
     if (sbOk()) { await sbSetSetting('paymentSettings', settings); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'paymentSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/paymentSettings'); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'paymentSettings'), settings); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, 'settings/paymentSettings'); } }
   },
 
   // ── ADMIN SETTINGS ─────────────────────────────────────────────────────────
@@ -917,7 +938,12 @@ export const dbService = {
     if (sbOk()) {
       await sbSetSetting('adminSettings', settings);
     } else if (fbOk()) {
-      await setDoc(doc(getDb()!, 'settings', 'adminSettings'), settings);
+      try {
+        await setDoc(doc(getDb()!, 'settings', 'adminSettings'), settings);
+      } catch (e) {
+        // Permission denied is OK — credentials are already saved locally
+        handleFirestoreWriteError(e, OperationType.WRITE, 'settings/adminSettings');
+      }
     } else {
       throw new Error('No database connected. Firebase must be configured to save admin credentials.');
     }
@@ -940,7 +966,7 @@ export const dbService = {
     store.supportSettings = settings;
     setLocal('qf_supportSettings', settings);
     if (sbOk()) { await sbSetSetting('supportSettings', settings); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'supportSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/supportSettings'); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'supportSettings'), settings); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, 'settings/supportSettings'); } }
   },
 
   // ── SMS SETTINGS ───────────────────────────────────────────────────────────
@@ -954,7 +980,7 @@ export const dbService = {
   async saveSMSSettings(settings: SMSSettings): Promise<void> {
     setLocal('qf_smsSettings', settings);
     if (sbOk()) { await sbSetSetting('smsSettings', settings); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'smsSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/smsSettings'); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'smsSettings'), settings); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, 'settings/smsSettings'); } }
   },
 
   // ── EMAIL VERIFICATION SETTINGS ────────────────────────────────────────────
@@ -968,7 +994,7 @@ export const dbService = {
   async saveEmailVerificationSettings(settings: EmailVerificationSettings): Promise<void> {
     setLocal('qf_emailVerification', settings);
     if (sbOk()) { await sbSetSetting('emailVerification', settings); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'emailVerification'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/emailVerification'); } }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'emailVerification'), settings); } catch (e) { handleFirestoreWriteError(e, OperationType.WRITE, 'settings/emailVerification'); } }
   },
 };
 

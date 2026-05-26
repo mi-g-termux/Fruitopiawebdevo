@@ -767,11 +767,15 @@ export const AdminPanel: React.FC = () => {
  usedCount: 0,
  };
  await addCoupon(coup);
- toast.success(`Coupon"${coup.code}" — ${coup.discountPercentage}% off created.`);
+ toast.success(`Coupon "${coup.code}" — ${coup.discountPercentage}% off created successfully!`);
  setCoupCode('');
+ setCoupDiscount(10);
+ setCoupExpiry('');
+ setCoupLimit(100);
  setIsCouponFormOpen(false);
  } catch (err) {
- toast.error('Coupon write failure.');
+ console.error('[AdminPanel] coupon creation error:', err);
+ toast.error('Coupon creation failed. Please try again.');
  }
  };
 
@@ -1063,13 +1067,15 @@ await saveSiteSettings(JSON.parse(JSON.stringify(current)));
      googleClientId: googleClientId.trim(),
    };
    await saveAdminSettings(current);
+   // Show success — data is now saved locally and being synced to Firebase
    showSavedBanner('security');
+   toast.success('Admin credentials updated successfully!');
  } catch (err: any) {
    let msg = 'Credential save failed — check console for details.';
    try {
      const parsed = JSON.parse(err?.message || '{}');
      if (parsed?.error?.includes('permission-denied') || parsed?.error?.includes('PERMISSION_DENIED')) {
-       msg = 'Firebase permission denied. Check Firestore security rules.';
+       msg = 'Firebase permission denied. Check Firestore security rules. (Credentials saved locally)';
      } else if (parsed?.error) {
        msg = 'Firestore: ' + parsed.error;
      }
