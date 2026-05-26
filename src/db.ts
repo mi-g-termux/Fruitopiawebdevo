@@ -890,10 +890,16 @@ export const dbService = {
   },
 
   async saveAdminSettings(settings: AdminCredentials): Promise<void> {
+    // Write to backend FIRST — if it fails, don't update local state
+    if (sbOk()) {
+      await sbSetSetting('adminSettings', settings);
+    } else if (fbOk()) {
+      // Let the error propagate — caller handles it with a proper message
+      await setDoc(doc(getDb()!, 'settings', 'adminSettings'), settings);
+    }
+    // Only update in-memory and localStorage after backend confirms success
     store.adminSettings = settings;
     setLocal('qf_adminSettings', settings);
-    if (sbOk()) { await sbSetSetting('adminSettings', settings); return; }
-    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'adminSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/adminSettings'); } }
   },
 
   // ── SUPPORT SETTINGS ───────────────────────────────────────────────────────

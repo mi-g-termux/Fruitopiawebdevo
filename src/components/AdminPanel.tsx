@@ -1024,24 +1024,34 @@ await saveSiteSettings(JSON.parse(JSON.stringify(current)));
 
  const handleSaveSecurityCMS = async () => {
  if (!secUsername.trim() || !secPass.trim()) {
- toast.error('Credential fields cannot be left empty.');
- return;
+   toast.error('Credential fields cannot be left empty.');
+   return;
  }
  if (googleSignInEnabled && !googleClientId.trim()) {
- toast.error('Please enter a Google Client ID to enable Google Sign-In.');
- return;
+   toast.error('Please enter a Google Client ID to enable Google Sign-In.');
+   return;
  }
  try {
- const current = {
- username: secUsername.trim(),
- password: secPass.trim(),
- googleSignInEnabled,
- googleClientId: googleClientId.trim(),
- };
- await saveAdminSettings(current);
- showSavedBanner('security');
- } catch (err) {
- toast.error('Security CMS credential updating failed.');
+   const current = {
+     username: secUsername.trim(),
+     password: secPass.trim(),
+     googleSignInEnabled,
+     googleClientId: googleClientId.trim(),
+   };
+   await saveAdminSettings(current);
+   showSavedBanner('security');
+ } catch (err: any) {
+   let msg = 'Credential save failed — check console for details.';
+   try {
+     const parsed = JSON.parse(err?.message || '{}');
+     if (parsed?.error?.includes('permission-denied') || parsed?.error?.includes('PERMISSION_DENIED')) {
+       msg = 'Firebase permission denied. Open Firebase Console → Firestore → Rules and allow writes to settings/adminSettings.';
+     } else if (parsed?.error) {
+       msg = 'Firestore: ' + parsed.error;
+     }
+   } catch { if (err?.message) msg = err.message; }
+   console.error('[AdminPanel] saveAdminSettings error:', err);
+   toast.error(msg, { autoClose: 10000 });
  }
  };
 
