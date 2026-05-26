@@ -862,9 +862,31 @@ export const dbService = {
   // ── ADMIN SETTINGS ─────────────────────────────────────────────────────────
 
   async getAdminSettings(): Promise<AdminCredentials> {
-    if (sbOk()) { const v = await sbGetSetting<AdminCredentials>('adminSettings'); if (v) { store.adminSettings = v; setLocal('qf_adminSettings', v); return v; } }
-    if (fbOk()) { try { const snap = await getDoc(doc(getDb()!, 'settings', 'adminSettings')); if (snap.exists()) { const v = snap.data() as AdminCredentials; store.adminSettings = v; setLocal('qf_adminSettings', v); return v; } } catch (err) { console.warn('[db] Firebase getAdmin fallback:', err); } }
-    return store.adminSettings;
+    // Always prefer live backend — never serve stale localStorage defaults
+    if (sbOk()) {
+      const v = await sbGetSetting<AdminCredentials>('adminSettings');
+      if (v) { store.adminSettings = v; setLocal('qf_adminSettings', v); return v; }
+    }
+    if (fbOk()) {
+      try {
+        const snap = await getDoc(doc(getDb()!, 'settings', 'adminSettings'));
+        if (snap.exists()) {
+          const v = snap.data() as AdminCredentials;
+          store.adminSettings = v;
+          setLocal('qf_adminSettings', v);
+          return v;
+        }
+      } catch (err) { console.warn('[db] Firebase getAdmin fallback:', err); }
+    }
+    // Only fall back to localStorage if it has REAL data (not the default admin/admin123)
+    const cached = store.adminSettings;
+    if (cached && cached.username && cached.username !== DEFAULT_ADMIN_CREDENTIALS.username) {
+      return cached;
+    }
+    // Clear stale default so it doesn't poison future checks
+    try { localStorage.removeItem('qf_adminSettings'); } catch {}
+    store.adminSettings = DEFAULT_ADMIN_CREDENTIALS;
+    return DEFAULT_ADMIN_CREDENTIALS;
   },
 
   async saveAdminSettings(settings: AdminCredentials): Promise<void> {

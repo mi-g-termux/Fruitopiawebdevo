@@ -31,7 +31,7 @@ import {
  Download,
 } from'lucide-react';
 import { Product, Coupon, Category, DeliveryZone } from'../types';
-import { simpleHash } from'../db';
+import { dbService } from'../db';
 
 
 export const AdminPanel: React.FC = () => {
@@ -432,20 +432,26 @@ export const AdminPanel: React.FC = () => {
  const [googleSignInEnabled, setGoogleSignInEnabled] = useState(adminSettings.googleSignInEnabled ?? false);
  const [googleClientId, setGoogleClientId] = useState(adminSettings.googleClientId ||'');
 
- const handleAdminVerify = (e: React.FormEvent) => {
+ const handleAdminVerify = async (e: React.FormEvent) => {
  e.preventDefault();
  setLoginError('');
  setLoginSuccess('');
- if (
- usernameInput.trim() === adminSettings.username &&
- passwordInput.trim() === adminSettings.password
- ) {
- setLoginSuccess('Access granted! Loading Store Admin...');
- setTimeout(() => {
- setAdminLoggedIn(true, usernameInput.trim(), passwordInput.trim());
- }, 900);
- } else {
- setLoginError('Invalid credentials. Please check your username and password.');
+ try {
+   // Always fetch live credentials from Firestore — never trust cached state
+   const liveSettings = await dbService.getAdminSettings();
+   if (
+     usernameInput.trim() === liveSettings.username &&
+     passwordInput.trim() === liveSettings.password
+   ) {
+     setLoginSuccess('Access granted! Loading Store Admin...');
+     setTimeout(() => {
+       setAdminLoggedIn(true, usernameInput.trim(), passwordInput.trim());
+     }, 900);
+   } else {
+     setLoginError('Invalid credentials. Please check your username and password.');
+   }
+ } catch {
+   setLoginError('Could not verify credentials. Check your connection and try again.');
  }
  };
 

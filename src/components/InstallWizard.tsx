@@ -10,7 +10,6 @@ import {
   DEFAULT_PAYMENT_SETTINGS,
   DEFAULT_SMTP_SETTINGS,
   DEFAULT_SUPPORT_SETTINGS,
-  simpleHash,
 } from '../db'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -169,7 +168,7 @@ function Step6Install({
       await withTimeout(
         setDoc(doc(db, 'settings', 'adminSettings'), {
           username: admin.username,
-          password: simpleHash(admin.password),
+          password: admin.password,
         }),
         15000, 'Creating admin account'
       )

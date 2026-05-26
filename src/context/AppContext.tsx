@@ -529,6 +529,16 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
     if (engine !== 'local') {
       _mountListenersForEngine(engine);
     }
+
+    // Cross-tab credential sync: when admin changes password in one tab,
+    // all other open tabs/browsers reload admin settings from Firestore
+    const handleStorageEvent = (e: StorageEvent) => {
+      if (e.key === 'qf_admin_cred_updated') {
+        dbService.getAdminSettings().then(setAdminSettings).catch(() => {});
+      }
+    };
+    window.addEventListener('storage', handleStorageEvent);
+    return () => window.removeEventListener('storage', handleStorageEvent);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1030,7 +1040,16 @@ setProducts([...products]);
 
   const saveSMTPSettings              = async (s: SMTPSettings)              => { await dbService.saveSMTPSettings(s);              setSmtpSettings(s); };
   const savePaymentSettings           = async (s: PaymentSettings)           => { await dbService.savePaymentSettings(s);           setPaymentSettings(s); };
-  const saveAdminSettings             = async (s: AdminCredentials)          => { await dbService.saveAdminSettings(s);             setAdminSettings(s); };
+  const saveAdminSettings = async (s: AdminCredentials) => {
+    await dbService.saveAdminSettings(s);
+    setAdminSettings(s);
+    // Broadcast credential change to all open tabs via storage event
+    try {
+      localStorage.setItem('qf_adminSettings', JSON.stringify(s));
+      // Trigger cross-tab notification
+      localStorage.setItem('qf_admin_cred_updated', Date.now().toString());
+    } catch {}
+  };
   const saveSupportSettings           = async (s: SupportSettings)           => { await dbService.saveSupportSettings(s);           setSupportSettings(s); triggerTawkToLoader(); };
   const saveSMSSettings               = async (s: SMSSettings)               => { await dbService.saveSMSSettings(s);               setSMSSettings(s); };
   const saveEmailVerificationSettings = async (s: EmailVerificationSettings) => { await dbService.saveEmailVerificationSettings(s); setEmailVerificationSettings(s); };
