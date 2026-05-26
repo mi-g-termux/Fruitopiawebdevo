@@ -1,0 +1,1017 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  Fruitopia — Polymorphic Database Service Layer  (db.ts)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * ARCHITECTURE OVERVIEW
+ * ─────────────────────
+ * This module is the single entry point for ALL data access in Fruitopia.
+ * It implements a tri-mode polymorphic backend:
+ *
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │  Active Engine Key: localStorage('fruitopia_active_engine') │
+ *   │  Values: 'local' | 'firebase' | 'supabase'                  │
+ *   └─────────────────────────────────────────────────────────────┘
+ *          │                   │                   │
+ *     ┌────▼────┐       ┌──────▼──────┐    ┌───────▼───────┐
+ *     │  LOCAL  │       │  FIREBASE   │    │   SUPABASE    │
+ *     │  MOCK   │       │  FIRESTORE  │    │  POSTGRESQL   │
+ *     │(default)│       │  (Google)   │    │  (Supabase)   │
+ *     └─────────┘       └─────────────┘    └───────────────┘
+ *
+ * FALLBACK CHAIN
+ * ──────────────
+ * If credentials are missing or a backend throws on connect:
+ *   supabase → firebase → local (never crashes the app)
+ *
+ * ENGINE SWITCHING
+ * ────────────────
+ * `switchActiveDatabaseEngine(engine, credentials)` is the public API for
+ * hot-swapping at runtime. It is called by AppContext after the admin
+ * clicks "Verify & Save Configuration" in the Cloud Infrastructure panel.
+ *
+ * SUPABASE TABLE SCHEMA (required if using Supabase)
+ * ───────────────────────────────────────────────────
+ * All Supabase collections map to a single generic key-value table:
+ *
+ *   CREATE TABLE settings (
+ *     key   TEXT PRIMARY KEY,
+ *     value JSONB NOT NULL
+ *   );
+ *
+ *   CREATE TABLE products   (id TEXT PRIMARY KEY, data JSONB NOT NULL);
+ *   CREATE TABLE orders     (id TEXT PRIMARY KEY, data JSONB NOT NULL);
+ *   CREATE TABLE coupons    (id TEXT PRIMARY KEY, data JSONB NOT NULL);
+ *   CREATE TABLE categories (id TEXT PRIMARY KEY, data JSONB NOT NULL);
+ *   CREATE TABLE newsletter (id TEXT PRIMARY KEY, data JSONB NOT NULL);
+ *   CREATE TABLE reviews    (id TEXT PRIMARY KEY, data JSONB NOT NULL);
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+import {
+  db as _firebaseDb,
+  getIsFirebaseConfigured,
+  handleFirestoreError,
+  OperationType,
+} from './firebase';
+import {
+  getSupabaseClient,
+  getIsSupabaseConfigured,
+} from './supabase';
+import {
+  collection,
+  getDocs,
+  doc,
+  setDoc,
+  getDoc,
+  deleteDoc,
+  query,
+  where,
+} from 'firebase/firestore';
+import type { DatabaseEngine, EngineCredentials } from './types';
+import {
+  Product,
+  Order,
+  Coupon,
+  NewsletterSubscriber,
+  Review,
+  SiteSettings,
+  SMTPSettings,
+  PaymentSettings,
+  AdminCredentials,
+  SupportSettings,
+  Category,
+  SMSSettings,
+  EmailVerificationSettings,
+  DeliveryZone,
+} from './types';
+
+// ── Live getters so we always read the current instance after hot-swap ───────
+const getDb   = () => _firebaseDb;
+const fbOk    = () => getIsFirebaseConfigured() && !!getDb();
+const sbOk    = () => getIsSupabaseConfigured() && !!getSupabaseClient();
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ENGINE REGISTRY — localStorage keys
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** localStorage key that persists the admin's chosen engine across refreshes */
+export const ACTIVE_ENGINE_KEY = 'fruitopia_active_engine';
+
+/**
+ * Read the currently persisted engine type.
+ * Defaults to 'local' if the key is absent or invalid.
+ */
+export function getActiveEngine(): DatabaseEngine {
+  try {
+    const raw = localStorage.getItem(ACTIVE_ENGINE_KEY) as DatabaseEngine | null;
+    if (raw === 'firebase' || raw === 'supabase' || raw === 'local') return raw;
+    return 'local';
+  } catch {
+    return 'local';
+  }
+}
+
+/**
+ * Persist the chosen engine type WITHOUT triggering a connection attempt.
+ * The actual connection is handled by AppContext's `switchActiveDatabaseEngine`.
+ */
+export function setActiveEngine(engine: DatabaseEngine): void {
+  try {
+    localStorage.setItem(ACTIVE_ENGINE_KEY, engine);
+  } catch {
+    /* Storage quota exceeded — ignore */
+  }
+}
+
+// ── Engine-change listeners — AppContext subscribes to get instant updates ──
+type EngineChangeCallback = (engine: DatabaseEngine) => void;
+const _engineListeners = new Set<EngineChangeCallback>();
+
+export function onEngineChange(cb: EngineChangeCallback): () => void {
+  _engineListeners.add(cb);
+  return () => _engineListeners.delete(cb);
+}
+
+function _notifyEngineChange(engine: DatabaseEngine) {
+  _engineListeners.forEach((cb) => cb(engine));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ENGINE SWITCHER — The Core Hot-Swap Function
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * `switchActiveDatabaseEngine` — the primary public API for polymorphic
+ * backend switching.
+ *
+ * Flow:
+ *  1. Validate credentials shape for the requested engine.
+ *  2. Call the appropriate driver's reinitialize/boot function.
+ *  3. On success: persist engine key, fire EngineChange callbacks.
+ *  4. On failure: fall back to 'local' mode, never crash.
+ *
+ * @param engine      - Target engine: 'local' | 'firebase' | 'supabase'
+ * @param credentials - Engine-specific credentials (null for 'local')
+ * @returns           - { success, message, activeEngine }
+ */
+export async function switchActiveDatabaseEngine(
+  engine: DatabaseEngine,
+  credentials: EngineCredentials,
+): Promise<{ success: boolean; message: string; activeEngine: DatabaseEngine }> {
+
+  // ── LOCAL mode: always succeeds ──────────────────────────────────────────
+  if (engine === 'local') {
+    setActiveEngine('local');
+    _notifyEngineChange('local');
+    return {
+      success: true,
+      message: 'Switched to Local Mock Mode. Data is stored in this browser only.',
+      activeEngine: 'local',
+    };
+  }
+
+  // ── FIREBASE mode ────────────────────────────────────────────────────────
+  if (engine === 'firebase') {
+    const creds = credentials as import('./types').FirebaseCredentials | null;
+    if (!creds?.apiKey || !creds?.projectId) {
+      return {
+        success: false,
+        message: 'Firebase requires at minimum an API Key and Project ID.',
+        activeEngine: getActiveEngine(),
+      };
+    }
+    try {
+      const { reinitializeDynamicFirebase } = await import('./firebase');
+      const result = await reinitializeDynamicFirebase({
+        apiKey:            creds.apiKey,
+        authDomain:        creds.authDomain,
+        projectId:         creds.projectId,
+        storageBucket:     creds.storageBucket,
+        messagingSenderId: creds.messagingSenderId,
+        appId:             creds.appId,
+        databaseId:        creds.databaseId,
+      });
+      if (result.success) {
+        setActiveEngine('firebase');
+        _notifyEngineChange('firebase');
+        return { success: true, message: result.message, activeEngine: 'firebase' };
+      }
+      // Firebase rejected — graceful fallback to local
+      console.warn('[db] Firebase init rejected, falling back to local.');
+      setActiveEngine('local');
+      _notifyEngineChange('local');
+      return {
+        success: false,
+        message: result.message + ' — Falling back to Local Mock Mode.',
+        activeEngine: 'local',
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setActiveEngine('local');
+      _notifyEngineChange('local');
+      return {
+        success: false,
+        message: `Firebase switch error: ${msg} — Falling back to Local Mock Mode.`,
+        activeEngine: 'local',
+      };
+    }
+  }
+
+  // ── SUPABASE mode ────────────────────────────────────────────────────────
+  if (engine === 'supabase') {
+    const creds = credentials as import('./types').SupabaseCredentials | null;
+    if (!creds?.projectUrl || !creds?.anonKey) {
+      return {
+        success: false,
+        message: 'Supabase requires a Project URL and Anon Key.',
+        activeEngine: getActiveEngine(),
+      };
+    }
+    try {
+      const { reinitializeSupabase } = await import('./supabase');
+      const result = await reinitializeSupabase({
+        projectUrl: creds.projectUrl,
+        anonKey:    creds.anonKey,
+      });
+      if (result.success) {
+        setActiveEngine('supabase');
+        _notifyEngineChange('supabase');
+        return { success: true, message: result.message, activeEngine: 'supabase' };
+      }
+      // Supabase rejected — graceful fallback
+      console.warn('[db] Supabase init rejected, falling back to local.');
+      setActiveEngine('local');
+      _notifyEngineChange('local');
+      return {
+        success: false,
+        message: result.message + ' — Falling back to Local Mock Mode.',
+        activeEngine: 'local',
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setActiveEngine('local');
+      _notifyEngineChange('local');
+      return {
+        success: false,
+        message: `Supabase switch error: ${msg} — Falling back to Local Mock Mode.`,
+        activeEngine: 'local',
+      };
+    }
+  }
+
+  // ── Unknown engine: hard fallback ────────────────────────────────────────
+  return {
+    success: false,
+    message: `Unknown engine "${engine}". Staying on current engine.`,
+    activeEngine: getActiveEngine(),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  INITIAL POLISHED SEED DATA
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const DEFAULT_CATEGORIES: Category[] = [
+  { id: 'smoothies',   name: 'Smoothies',      emoji: '🥤', slug: 'smoothies',   isVisible: true },
+  { id: 'fresh-juice', name: 'Fresh Juice',     emoji: '🍹', slug: 'fresh-juice', isVisible: true },
+  { id: 'snacks',      name: 'Healthy Snacks',  emoji: '🍎', slug: 'snacks',      isVisible: true },
+];
+
+export const DEFAULT_PRODUCTS: Product[] = [
+  // Smoothies
+  { id: 'p1',  name: 'Papaya Smoothie',    description: 'Creamy master blend of fresh ripe papayas, soy milk, and honey.',                           price: 2.30, salePrice: null, stock: 25, image: '🥭', category: 'Smoothies',   ingredients: ['Papaya','Soy Milk','Honey'],              rating: 4.8, reviewsCount: 12, isFeatured: true,  isActive: true },
+  { id: 'p2',  name: 'Apple Smoothie',     description: 'Crisp red apples blended with low-fat greek yogurt and cinnamon.',                          price: 2.30, salePrice: null, stock: 8,  image: '🍎', category: 'Smoothies',   ingredients: ['Apple','Greek Yogurt','Cinnamon'],        rating: 4.5, reviewsCount: 6,  isFeatured: true,  isActive: true },
+  { id: 'p3',  name: 'Pineapple Smoothie', description: 'Tropical getaway in a glass. Blended pineapple, coconut cream, and banana.',                price: 2.30, salePrice: 1.99,stock: 14, image: '🍍', category: 'Smoothies',   ingredients: ['Pineapple','Coconut Cream','Banana'],     rating: 4.9, reviewsCount: 22, isFeatured: true,  isActive: true },
+  { id: 'p4',  name: 'Cherry Smoothie',    description: 'Indulge in rich sweet cherries blended with chia seeds and almond milk.',                   price: 2.30, salePrice: null, stock: 19, image: '🍒', category: 'Smoothies',   ingredients: ['Sweet Cherries','Chia Seeds','Almond Milk'],rating: 4.7,reviewsCount: 15, isFeatured: false, isActive: true },
+  { id: 'p5',  name: 'Avocado Smoothie',   description: 'Super food delight! Blended buttery rich avocados, spinach, and direct maple syrup.',       price: 2.30, salePrice: null, stock: 12, image: '🥑', category: 'Smoothies',   ingredients: ['Avocado','Spinach','Maple Syrup'],        rating: 4.6, reviewsCount: 9,  isFeatured: false, isActive: true },
+  { id: 'p6',  name: 'Kiwi Smoothie',      description: 'Zesty combination of fresh green kiwi, green grapes, and crushed mint lines.',              price: 2.30, salePrice: null, stock: 5,  image: '🥝', category: 'Smoothies',   ingredients: ['Kiwi','Green Grapes','Mint'],             rating: 4.4, reviewsCount: 7,  isFeatured: false, isActive: true },
+  { id: 'p7',  name: 'Banana Smoothie',    description: 'Classic rich fuel. Loaded sweet bananas blended with peanut butter and oat milk.',          price: 2.30, salePrice: null, stock: 32, image: '🍌', category: 'Smoothies',   ingredients: ['Banana','Peanut Butter','Oat Milk'],      rating: 4.9, reviewsCount: 31, isFeatured: true,  isActive: true },
+  // Fresh Juice
+  { id: 'p8',  name: 'Papaya Fresh Juice', description: 'Cold-pressed standard pure sweet papaya. No sugar added.',                                  price: 2.30, salePrice: null, stock: 15, image: '🍈', category: 'Fresh Juice', ingredients: ['Pure Papaya'],                            rating: 4.7, reviewsCount: 14, isFeatured: true,  isActive: true },
+  { id: 'p9',  name: 'Apple Fresh Juice',  description: 'Double cold-pressed organic gala apples. Fresh and crisp.',                                 price: 2.30, salePrice: null, stock: 22, image: '🍎', category: 'Fresh Juice', ingredients: ['Organic Gala Apples'],                   rating: 4.6, reviewsCount: 8,  isFeatured: true,  isActive: true },
+  { id: 'p10', name: 'Pineapple Fresh Juice',description: 'Sweet and tangy press. A tropical shot of energy.',                                       price: 2.30, salePrice: 1.99, stock: 3, image: '🍍', category: 'Fresh Juice', ingredients: ['Pure Pineapple'],                        rating: 4.8, reviewsCount: 18, isFeatured: true,  isActive: true },
+  { id: 'p11', name: 'Cherry Fresh Juice', description: 'Pure anti-oxidant power. Cherry press with a splash of soda water.',                        price: 2.30, salePrice: null, stock: 17, image: '🍒', category: 'Fresh Juice', ingredients: ['Cherries','Sparkling Water'],             rating: 4.5, reviewsCount: 11, isFeatured: false, isActive: true },
+  { id: 'p12', name: 'Avocado Fresh Juice',description: 'Lite dynamic extraction, cold pressed. Extremely creamy and clean.',                        price: 2.30, salePrice: null, stock: 11, image: '🥑', category: 'Fresh Juice', ingredients: ['Avocado','Squeeze of Lime'],              rating: 4.4, reviewsCount: 4,  isFeatured: false, isActive: true },
+  { id: 'p13', name: 'Kiwi Fresh Juice',   description: 'Vibrant active kiwi, cold pressed to conserve nutrients.',                                  price: 2.30, salePrice: null, stock: 16, image: '🥝', category: 'Fresh Juice', ingredients: ['Kiwi Juice'],                            rating: 4.7, reviewsCount: 9,  isFeatured: false, isActive: true },
+  { id: 'p14', name: 'Banana Fresh Juice', description: 'Smooth extraction of ripe bananas with water and organic agave syrup.',                     price: 2.30, salePrice: null, stock: 24, image: '🍌', category: 'Fresh Juice', ingredients: ['Banana','Agave'],                        rating: 4.5, reviewsCount: 16, isFeatured: true,  isActive: true },
+];
+
+export const DEFAULT_COUPONS: Coupon[] = [
+  { id: 'c1', code: 'FRUITY20',  discountPercentage: 20, expiryDate: '2028-12-31', usageLimit: 100, usedCount: 5 },
+  { id: 'c2', code: 'HEALTHY10', discountPercentage: 10, expiryDate: '2028-12-31', usageLimit: 500, usedCount: 12 },
+  { id: 'c3', code: 'FRESH50',   discountPercentage: 50, expiryDate: '2028-06-01', usageLimit: 10,  usedCount: 2 },
+];
+
+export const DEFAULT_SITE_SETTINGS: SiteSettings = {
+  websiteName: 'quirky-fruity',
+  siteTitle: 'Quirky Fruity — Fresh Organic Smoothies & Juices',
+  logoUrl: '',
+  logoEmoji: '',
+  faviconUrl: '',
+  heroBadge: 'Deliciously Fresh menu!',
+  heroTitleLine1: 'Treat yourself',
+  heroTitleLine2: 'with something fresh & tasty!',
+  heroSubtitle: 'Handcrafted with premium fresh organic ingredients, serving smiles with every vibrant drop.',
+  heroButtonText: 'SEE MENU & ORDER',
+  heroTimeBadge: 'open from 8 am – 10 pm',
+  footerText: 'quirky-fruity: serving dynamic organic fuel to nourish your daily vibrant self.',
+  footerLinks: [
+    { label: 'Home', url: '/' },
+    { label: 'Menu', url: '#menu' },
+    { label: 'Reviews', url: '#reviews' },
+    { label: 'Newsletter', url: '#newsletter' },
+  ],
+  contactPhone: '+880 1711-223344',
+  contactEmail: 'hello@quirkyfruity.com',
+  contactAddress: '42 Orchard Lane, Gulshan, Dhaka, Bangladesh',
+  socialFacebook:  'https://facebook.com/quirkyfruity',
+  socialInstagram: 'https://instagram.com/quirkyfruity',
+  socialTwitter:   'https://twitter.com/quirkyfruity',
+  promoBannerEnabled: true,
+  promoBannerText: '🎉 SPECIAL LAUNCH PROMO: Apply code FRUITY20 to get 20% off all orders!',
+  themePrimaryColor: '#ff5c35',
+  themeBgColor:      '#fcf3e3',
+  themeHeaderFont:   'Space Grotesk',
+  trademarkText: '© 2026 quirky-fruity Ltd. All rights reserved.',
+  newsletterSectionIcon:  '',
+  testimonialSectionIcon: '',
+  currency:         'USD',
+  currencySymbol:   '$',
+  currencyPosition: 'before',
+  orderTrackerEnabled:  true,
+  orderTrackerInNavbar: false,
+  maintenanceMode:    false,
+  maintenanceTitle:   '',
+  maintenanceMessage: '',
+};
+
+export const DEFAULT_PAYMENT_SETTINGS: PaymentSettings = {
+  codEnabled: true,
+  bKashEnabled: true, bKashNo: '01711000222', bKashInstructions: 'Pay to our Merchant bKash wallet and submit the Transaction ID.', bKashLogoEmoji: '💸', bKashQrCodeUrl: 'https://images.unsplash.com/photo-1595079676339-1534801ad6cf?w=400',
+  nagadEnabled: true, nagadNo: '01911333444', nagadInstructions: 'Send Money to our personal Nagad number and input Transaction ID.', nagadLogoEmoji: '🟠', nagadQrCodeUrl: '',
+  rocketEnabled: true, rocketNo: '01511555666_7', rocketInstructions: 'Send Money to our agent Rocket dial *322# and input Txn Ref.', rocketLogoEmoji: '🟣', rocketQrCodeUrl: '',
+  bankEnabled: true, bankNo: '102.345.6789.01', bankInstructions: 'Transfer amount directly to our Bank. Specify order reference in transfer description.', bankLogoEmoji: '🏦', bankQrCodeUrl: '', bankName: 'Dhaka Bank Ltd', bankHolder: 'Quirky Fruity Solutions Ltd',
+  creditManualEnabled: true, creditManualNo: '4111-2222-3333-4444', creditManualInstructions: 'Submit details of bank memo transfer receipt photo or number.', creditManualLogoEmoji: '💳', creditManualQrCodeUrl: '',
+  paypalEnabled: true, paypalClientId: 'sb-paypal-client-id-9988', paypalSandboxMode: true,
+  bKashAutoEnabled: true, nagadAutoEnabled: true,
+  stripeEnabled: true, stripePublicKey: 'pk_test_51O7...', stripeSecretKey: 'sk_test_51O7...', stripeSandboxMode: true,
+  sslCommerzEnabled: true, sslCommerzStoreId: 'quirky_fruity_ssl', sslCommerzStorePassword: 'ssl_test_password', sslCommerzSandboxMode: true,
+  razorpayEnabled: true, razorpayKeyId: 'rzp_test_key_123', razorpayKeySecret: 'rzp_secret_secret_123', razorpaySandboxMode: true,
+  cardPaymentEnabled: true, shippingFee: 5, taxPercentage: 0.05,
+  codBtnColor: '#16a34a', bKashBtnColor: '#e11d48', nagadBtnColor: '#ea580c', rocketBtnColor: '#7c3aed',
+  bankBtnColor: '#2563eb', creditManualBtnColor: '#334155', paypalBtnColor: '#1d4ed8', stripeBtnColor: '#4f46e5',
+  bKashAutoBtnColor: '#be123c', nagadAutoBtnColor: '#d97706',
+};
+
+export const DEFAULT_SMTP_SETTINGS: SMTPSettings = {
+  host: 'smtp.gmail.com', port: 587, email: 'notifications@quirkyfruity.com', password: '', isEnabled: false,
+};
+
+export const DEFAULT_ADMIN_CREDENTIALS: AdminCredentials = {
+  username: 'admin', password: 'admin123', googleSignInEnabled: false, googleClientId: '',
+};
+
+export const DEFAULT_SUPPORT_SETTINGS: SupportSettings = {
+  tawkToId: '65cb1234abcd...', isEnabled: false,
+};
+
+export const DEFAULT_SMS_SETTINGS: SMSSettings = {
+  isEnabled: false, provider: 'twilio', accountSid: '', authToken: '', fromNumber: '',
+  otpEnabled: true, otpExpiryMinutes: 10,
+  otpMessageTemplate: '{{code}} is your {{store}} verification code. Valid for {{expiry}} min.',
+};
+
+export const DEFAULT_DELIVERY_ZONES: DeliveryZone[] = [
+  { id: 'dz_dhaka', name: 'Dhaka & Surroundings', keywords: ['dhaka','narayanganj','gazipur','manikganj'], fee: 60,  minDays: 1, maxDays: 2, isEnabled: true },
+  { id: 'dz_major', name: 'Major Cities',          keywords: ['chittagong','sylhet','khulna','rajshahi','barishal','comilla','mymensingh'], fee: 100, minDays: 2, maxDays: 3, isEnabled: true },
+  { id: 'dz_other', name: 'Rest of Country',       keywords: [], fee: 150, minDays: 4, maxDays: 7, isEnabled: true },
+];
+
+export function getDeliveryZones(): DeliveryZone[] {
+  try { return JSON.parse(localStorage.getItem('qf_delivery_zones') || 'null') || DEFAULT_DELIVERY_ZONES; }
+  catch { return DEFAULT_DELIVERY_ZONES; }
+}
+export function saveDeliveryZones(zones: DeliveryZone[]): void {
+  localStorage.setItem('qf_delivery_zones', JSON.stringify(zones));
+}
+
+export const DEFAULT_EMAIL_VERIFICATION_SETTINGS: EmailVerificationSettings = {
+  isEnabled: false, requireVerificationBeforeOrder: false, tokenExpiryHours: 24,
+};
+
+export const DEFAULT_REVIEWS: Review[] = [
+  { id: 'r1', productId: 'p1', reviewerName: 'Christian Amon',  rating: 5, comment: 'Hands down the best smoothies in town! The textures are unbelievably rich and the delivery is always super fast. Truly fresh and tasty! ⭐⭐⭐⭐⭐', isApproved: true, createdAt: '2026-05-20T10:15:00Z' },
+  { id: 'r2', productId: 'p3', reviewerName: 'Samantha Ray',    rating: 5, comment: 'The Pineapple Smoothie has a perfect balance of tropical sweetness and citrus punch. Highly recommend this store!',                              isApproved: true, createdAt: '2026-05-21T14:22:00Z' },
+  { id: 'r3', productId: 'p8', reviewerName: 'David K.',         rating: 4, comment: 'Organic, purely fresh, high quality. No artificial sweetners. Will order again.',                                                                isApproved: true, createdAt: '2026-05-22T08:05:00Z' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LOCAL STORAGE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getLocal<T>(key: string, defaultValue: T): T {
+  try {
+    const data = localStorage.getItem(key);
+    return data ? JSON.parse(data) : defaultValue;
+  } catch { return defaultValue; }
+}
+
+function setLocal<T>(key: string, value: T): void {
+  try { localStorage.setItem(key, JSON.stringify(value)); }
+  catch (e) { console.warn('localStorage write failed:', e); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  IN-MEMORY STORE (hydrated from localStorage on module load)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const store = {
+  products:      getLocal<Product[]>('qf_products',   DEFAULT_PRODUCTS),
+  categories:    getLocal<Category[]>('qf_categories', DEFAULT_CATEGORIES),
+  orders:        getLocal<Order[]>('qf_orders',        []),
+  coupons:       getLocal<Coupon[]>('qf_coupons',      DEFAULT_COUPONS),
+  newsletter:    getLocal<NewsletterSubscriber[]>('qf_newsletter', []),
+  reviews:       getLocal<Review[]>('qf_reviews',      DEFAULT_REVIEWS),
+  siteSettings:  { ...DEFAULT_SITE_SETTINGS, ...getLocal<Partial<SiteSettings>>('qf_siteSettings', {}) } as SiteSettings,
+  smtpSettings:  getLocal<SMTPSettings>('qf_smtpSettings',     DEFAULT_SMTP_SETTINGS),
+  paymentSettings: getLocal<PaymentSettings>('qf_paymentSettings', DEFAULT_PAYMENT_SETTINGS),
+  adminSettings: getLocal<AdminCredentials>('qf_adminSettings', DEFAULT_ADMIN_CREDENTIALS),
+  supportSettings: getLocal<SupportSettings>('qf_supportSettings', DEFAULT_SUPPORT_SETTINGS),
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SUPABASE HELPERS — Generic JSONB row read/write
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch all rows from a Supabase table.
+ * Assumes schema: (id TEXT PRIMARY KEY, data JSONB NOT NULL)
+ * Returns array of merged { id, ...data } objects or null on error.
+ */
+async function sbGetAll<T extends { id: string }>(table: string): Promise<T[] | null> {
+  if (!sbOk()) return null;
+  try {
+    const sb = getSupabaseClient();
+    const { data, error } = await sb.from(table).select('id, data');
+    if (error) { console.warn(`[Supabase] ${table} select error:`, error); return null; }
+    return (data || []).map((row: { id: string; data: Record<string, unknown> }) => ({
+      id: row.id,
+      ...row.data,
+    })) as T[];
+  } catch (err) {
+    console.warn(`[Supabase] ${table} getAll threw:`, err);
+    return null;
+  }
+}
+
+/**
+ * Upsert a single row into a Supabase table.
+ * Schema: (id TEXT PRIMARY KEY, data JSONB NOT NULL)
+ */
+async function sbUpsert<T extends { id: string }>(table: string, item: T): Promise<void> {
+  if (!sbOk()) return;
+  try {
+    const sb = getSupabaseClient();
+    const { id, ...rest } = item;
+    const { error } = await sb.from(table).upsert({ id, data: rest }, { onConflict: 'id' });
+    if (error) console.warn(`[Supabase] ${table} upsert error:`, error);
+  } catch (err) {
+    console.warn(`[Supabase] ${table} upsert threw:`, err);
+  }
+}
+
+/**
+ * Delete a row from a Supabase table by id.
+ */
+async function sbDelete(table: string, id: string): Promise<void> {
+  if (!sbOk()) return;
+  try {
+    const sb = getSupabaseClient();
+    const { error } = await sb.from(table).delete().eq('id', id);
+    if (error) console.warn(`[Supabase] ${table} delete error:`, error);
+  } catch (err) {
+    console.warn(`[Supabase] ${table} delete threw:`, err);
+  }
+}
+
+/**
+ * Read a singleton settings record from the `settings` table.
+ * Schema: (key TEXT PRIMARY KEY, value JSONB NOT NULL)
+ */
+async function sbGetSetting<T>(key: string): Promise<T | null> {
+  if (!sbOk()) return null;
+  try {
+    const sb = getSupabaseClient();
+    const { data, error } = await sb.from('settings').select('value').eq('key', key).single();
+    if (error || !data) return null;
+    return data.value as T;
+  } catch { return null; }
+}
+
+/**
+ * Write a singleton settings record to the `settings` table.
+ */
+async function sbSetSetting<T>(key: string, value: T): Promise<void> {
+  if (!sbOk()) return;
+  try {
+    const sb = getSupabaseClient();
+    const { error } = await sb.from('settings').upsert({ key, value }, { onConflict: 'key' });
+    if (error) console.warn(`[Supabase] settings upsert "${key}" error:`, error);
+  } catch (err) {
+    console.warn(`[Supabase] settings upsert "${key}" threw:`, err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  UNIFIED dbService — POLYMORPHIC CRUD API
+//  Each method tries: Supabase → Firebase → Local  (in that priority order,
+//  based on which engine is currently active and connected)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const dbService = {
+
+  // ── PRODUCTS ───────────────────────────────────────────────────────────────
+
+  async getProducts(): Promise<Product[]> {
+    // Supabase path
+    if (sbOk()) {
+      const rows = await sbGetAll<Product>('products');
+      if (rows !== null) {
+        store.products = rows.length > 0 ? rows : store.products;
+        setLocal('qf_products', store.products);
+        return store.products;
+      }
+    }
+    // Firebase path
+    if (fbOk()) {
+      try {
+        const snap = await getDocs(collection(getDb()!, 'products'));
+        const list: Product[] = [];
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Product));
+        store.products = list;
+        setLocal('qf_products', list);
+        return list;
+      } catch (err) { console.warn('[db] Firebase getProducts fallback:', err); }
+    }
+    // Local path
+    store.products = store.products.filter((p, i, a) => a.findIndex(x => x.id === p.id) === i);
+    return store.products;
+  },
+
+  async saveProduct(product: Product): Promise<void> {
+    // Update local store first (optimistic)
+    const idx = store.products.findIndex(p => p.id === product.id);
+    if (idx > -1) store.products[idx] = product; else store.products.push(product);
+    store.products = store.products.filter((p, i, a) => a.findIndex(x => x.id === p.id) === i);
+    setLocal('qf_products', store.products);
+    // Persist to active cloud backend
+    if (sbOk()) { await sbUpsert('products', product); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'products', product.id), product); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `products/${product.id}`); } }
+  },
+
+  async deleteProduct(productId: string): Promise<void> {
+    store.products = store.products.filter(p => p.id !== productId);
+    setLocal('qf_products', store.products);
+    if (sbOk()) { await sbDelete('products', productId); return; }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'products', productId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `products/${productId}`); } }
+  },
+
+  // ── CATEGORIES ─────────────────────────────────────────────────────────────
+
+  async getCategories(): Promise<Category[]> {
+    if (sbOk()) {
+      const rows = await sbGetAll<Category>('categories');
+      if (rows !== null) {
+        store.categories = rows.length > 0 ? rows : store.categories;
+        setLocal('qf_categories', store.categories);
+        return store.categories;
+      }
+    }
+    if (fbOk()) {
+      try {
+        const snap = await getDocs(collection(getDb()!, 'categories'));
+        const list: Category[] = [];
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Category));
+        store.categories = list;
+        setLocal('qf_categories', list);
+        return list;
+      } catch (err) { console.warn('[db] Firebase getCategories fallback:', err); }
+    }
+    store.categories = store.categories.filter((c, i, a) => a.findIndex(x => x.id === c.id) === i);
+    return store.categories;
+  },
+
+  async saveCategory(category: Category): Promise<void> {
+    const idx = store.categories.findIndex(c => c.id === category.id);
+    if (idx > -1) store.categories[idx] = category; else store.categories.push(category);
+    store.categories = store.categories.filter((c, i, a) => a.findIndex(x => x.id === c.id) === i);
+    setLocal('qf_categories', store.categories);
+    if (sbOk()) { await sbUpsert('categories', category); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'categories', category.id), category); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `categories/${category.id}`); } }
+  },
+
+  async deleteCategory(categoryId: string): Promise<void> {
+    store.categories = store.categories.filter(c => c.id !== categoryId);
+    setLocal('qf_categories', store.categories);
+    if (sbOk()) { await sbDelete('categories', categoryId); return; }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'categories', categoryId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `categories/${categoryId}`); } }
+  },
+
+  // ── ORDERS ─────────────────────────────────────────────────────────────────
+
+  async getOrders(): Promise<Order[]> {
+    if (sbOk()) {
+      const rows = await sbGetAll<Order>('orders');
+      if (rows !== null && rows.length > 0) {
+        rows.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        store.orders = rows;
+        setLocal('qf_orders', rows);
+        return rows;
+      }
+    }
+    if (fbOk()) {
+      try {
+        const snap = await getDocs(collection(getDb()!, 'orders'));
+        const list: Order[] = [];
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Order));
+        list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        if (list.length > 0) { store.orders = list; setLocal('qf_orders', list); return list; }
+      } catch (err) { console.warn('[db] Firebase getOrders fallback:', err); }
+    }
+    return [...store.orders].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  },
+
+  async saveOrder(order: Order): Promise<void> {
+    const idx = store.orders.findIndex(o => o.id === order.id);
+    if (idx > -1) store.orders[idx] = order; else store.orders.push(order);
+    setLocal('qf_orders', store.orders);
+    if (sbOk()) { await sbUpsert('orders', order); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'orders', order.id), order); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `orders/${order.id}`); } }
+  },
+
+  async updateOrderStatus(orderId: string, status: Order['orderStatus']): Promise<void> {
+    const idx = store.orders.findIndex(o => o.id === orderId);
+    if (idx > -1) {
+      store.orders[idx].orderStatus = status;
+      if (status === 'Delivered') store.orders[idx].paymentStatus = 'Paid';
+      setLocal('qf_orders', store.orders);
+      if (sbOk()) { await sbUpsert('orders', store.orders[idx]); return; }
+      if (fbOk()) { try { await setDoc(doc(getDb()!, 'orders', orderId), store.orders[idx]); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `orders/${orderId}`); } }
+    }
+  },
+
+  async updateOrderPaymentStatus(orderId: string, status: Order['paymentStatus']): Promise<void> {
+    const idx = store.orders.findIndex(o => o.id === orderId);
+    if (idx > -1) {
+      store.orders[idx].paymentStatus = status;
+      setLocal('qf_orders', store.orders);
+      if (sbOk()) { await sbUpsert('orders', store.orders[idx]); return; }
+      if (fbOk()) { try { await setDoc(doc(getDb()!, 'orders', orderId), store.orders[idx]); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `orders/${orderId}`); } }
+    }
+  },
+
+  async deleteOrder(orderId: string): Promise<void> {
+    store.orders = store.orders.filter(o => o.id !== orderId);
+    setLocal('qf_orders', store.orders);
+    if (sbOk()) { await sbDelete('orders', orderId); return; }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'orders', orderId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `orders/${orderId}`); } }
+  },
+
+  // ── COUPONS ────────────────────────────────────────────────────────────────
+
+  async getCoupons(): Promise<Coupon[]> {
+    if (sbOk()) {
+      const rows = await sbGetAll<Coupon>('coupons');
+      if (rows !== null && rows.length > 0) { store.coupons = rows; setLocal('qf_coupons', rows); return rows; }
+    }
+    if (fbOk()) {
+      try {
+        const snap = await getDocs(collection(getDb()!, 'coupons'));
+        const list: Coupon[] = [];
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Coupon));
+        if (list.length > 0) { store.coupons = list; setLocal('qf_coupons', list); return list; }
+      } catch (err) { console.warn('[db] Firebase getCoupons fallback:', err); }
+    }
+    return store.coupons;
+  },
+
+  async saveCoupon(coupon: Coupon): Promise<void> {
+    const idx = store.coupons.findIndex(c => c.id === coupon.id);
+    if (idx > -1) store.coupons[idx] = coupon; else store.coupons.push(coupon);
+    setLocal('qf_coupons', store.coupons);
+    if (sbOk()) { await sbUpsert('coupons', coupon); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'coupons', coupon.id), coupon); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `coupons/${coupon.id}`); } }
+  },
+
+  async deleteCoupon(couponId: string): Promise<void> {
+    store.coupons = store.coupons.filter(c => c.id !== couponId);
+    setLocal('qf_coupons', store.coupons);
+    if (sbOk()) { await sbDelete('coupons', couponId); return; }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'coupons', couponId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `coupons/${couponId}`); } }
+  },
+
+  // ── NEWSLETTER ─────────────────────────────────────────────────────────────
+
+  async getNewsletterSubscribers(): Promise<NewsletterSubscriber[]> {
+    if (sbOk()) {
+      const rows = await sbGetAll<NewsletterSubscriber>('newsletter');
+      if (rows !== null && rows.length > 0) { store.newsletter = rows; setLocal('qf_newsletter', rows); return rows; }
+    }
+    if (fbOk()) {
+      try {
+        const snap = await getDocs(collection(getDb()!, 'newsletter'));
+        const list: NewsletterSubscriber[] = [];
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as NewsletterSubscriber));
+        if (list.length > 0) { store.newsletter = list; setLocal('qf_newsletter', list); return list; }
+      } catch (err) { console.warn('[db] Firebase getNewsletter fallback:', err); }
+    }
+    return store.newsletter;
+  },
+
+  async subscribeNewsletter(email: string): Promise<boolean> {
+    const cleaned = email.trim().toLowerCase();
+    if (!cleaned) return false;
+    if (store.newsletter.some(s => s.email.toLowerCase() === cleaned)) return false;
+    const sub: NewsletterSubscriber = { id: 'sub_' + Math.random().toString(36).substr(2, 9), email: cleaned, subscribedAt: new Date().toISOString() };
+    store.newsletter.push(sub);
+    setLocal('qf_newsletter', store.newsletter);
+    if (sbOk()) { await sbUpsert('newsletter', sub); return true; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'newsletter', sub.id), sub); } catch (e) { console.warn('[db] Firebase newsletter write failed (subscriber saved locally):', e); } }
+    return true;
+  },
+
+  async deleteSubscriber(id: string): Promise<void> {
+    store.newsletter = store.newsletter.filter(s => s.id !== id);
+    setLocal('qf_newsletter', store.newsletter);
+    if (sbOk()) { await sbDelete('newsletter', id); return; }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'newsletter', id)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `newsletter/${id}`); } }
+  },
+
+  // ── REVIEWS ────────────────────────────────────────────────────────────────
+
+  async getReviews(): Promise<Review[]> {
+    if (sbOk()) {
+      const rows = await sbGetAll<Review>('reviews');
+      if (rows !== null && rows.length > 0) { store.reviews = rows; setLocal('qf_reviews', rows); return rows; }
+    }
+    if (fbOk()) {
+      try {
+        const snap = await getDocs(collection(getDb()!, 'reviews'));
+        const list: Review[] = [];
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Review));
+        if (list.length > 0) { store.reviews = list; setLocal('qf_reviews', list); return list; }
+      } catch (err) { console.warn('[db] Firebase getReviews fallback:', err); }
+    }
+    return store.reviews;
+  },
+
+  async addReview(productId: string, name: string, rating: number, comment: string): Promise<void> {
+    const rev: Review = { id: 'rev_' + Math.random().toString(36).substr(2, 9), productId, reviewerName: name || 'Anonymous Guest', rating: rating || 5, comment: comment || '', isApproved: true, createdAt: new Date().toISOString() };
+    store.reviews.push(rev);
+    setLocal('qf_reviews', store.reviews);
+    // Recalculate product rating
+    const pIdx = store.products.findIndex(p => p.id === productId);
+    if (pIdx > -1) {
+      const pRevs = store.reviews.filter(r => r.productId === productId && r.isApproved);
+      store.products[pIdx].reviewsCount = pRevs.length;
+      store.products[pIdx].rating = Number((pRevs.reduce((s, r) => s + r.rating, 0) / Math.max(1, pRevs.length)).toFixed(1));
+      this.saveProduct(store.products[pIdx]);
+    }
+    if (sbOk()) { await sbUpsert('reviews', rev); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'reviews', rev.id), rev); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `reviews/${rev.id}`); } }
+  },
+
+  async approveReview(reviewId: string, isApproved: boolean): Promise<void> {
+    const idx = store.reviews.findIndex(r => r.id === reviewId);
+    if (idx > -1) {
+      store.reviews[idx].isApproved = isApproved;
+      setLocal('qf_reviews', store.reviews);
+      if (sbOk()) { await sbUpsert('reviews', store.reviews[idx]); return; }
+      if (fbOk()) { try { await setDoc(doc(getDb()!, 'reviews', reviewId), store.reviews[idx]); } catch (e) { handleFirestoreError(e, OperationType.WRITE, `reviews/${reviewId}`); } }
+    }
+  },
+
+  async deleteReview(reviewId: string): Promise<void> {
+    store.reviews = store.reviews.filter(r => r.id !== reviewId);
+    setLocal('qf_reviews', store.reviews);
+    if (sbOk()) { await sbDelete('reviews', reviewId); return; }
+    if (fbOk()) { try { await deleteDoc(doc(getDb()!, 'reviews', reviewId)); } catch (e) { handleFirestoreError(e, OperationType.DELETE, `reviews/${reviewId}`); } }
+  },
+
+  // ── SITE SETTINGS ──────────────────────────────────────────────────────────
+
+  async getSiteSettings(): Promise<SiteSettings> {
+    if (sbOk()) {
+      const val = await sbGetSetting<SiteSettings>('siteSettings');
+      if (val) { const merged = { ...DEFAULT_SITE_SETTINGS, ...val }; store.siteSettings = merged; setLocal('qf_siteSettings', merged); return merged; }
+    }
+    if (fbOk()) {
+      try {
+        const snap = await getDoc(doc(getDb()!, 'settings', 'siteSettings'));
+        if (snap.exists()) { const s = { ...DEFAULT_SITE_SETTINGS, ...snap.data() } as SiteSettings; store.siteSettings = s; setLocal('qf_siteSettings', s); return s; }
+        await setDoc(doc(getDb()!, 'settings', 'siteSettings'), store.siteSettings);
+        return store.siteSettings;
+      } catch (err) { console.warn('[db] Firebase getSiteSettings fallback:', err); }
+    }
+    return { ...DEFAULT_SITE_SETTINGS, ...store.siteSettings };
+  },
+
+  async saveSiteSettings(settings: SiteSettings): Promise<void> {
+    const merged = { ...DEFAULT_SITE_SETTINGS, ...settings };
+    store.siteSettings = merged;
+    setLocal('qf_siteSettings', merged);
+    if (sbOk()) { await sbSetSetting('siteSettings', settings); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'siteSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/siteSettings'); } }
+  },
+
+  // ── SMTP SETTINGS ──────────────────────────────────────────────────────────
+
+  async getSMTPSettings(): Promise<SMTPSettings> {
+    if (sbOk()) { const v = await sbGetSetting<SMTPSettings>('smtpSettings'); if (v) { store.smtpSettings = v; setLocal('qf_smtpSettings', v); return v; } }
+    if (fbOk()) { try { const snap = await getDoc(doc(getDb()!, 'settings', 'smtpSettings')); if (snap.exists()) { const v = snap.data() as SMTPSettings; store.smtpSettings = v; setLocal('qf_smtpSettings', v); return v; } } catch (err) { console.warn('[db] Firebase getSMTP fallback:', err); } }
+    return store.smtpSettings;
+  },
+
+  async saveSMTPSettings(settings: SMTPSettings): Promise<void> {
+    store.smtpSettings = settings;
+    setLocal('qf_smtpSettings', settings);
+    if (sbOk()) { await sbSetSetting('smtpSettings', settings); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'smtpSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/smtpSettings'); } }
+  },
+
+  // ── PAYMENT SETTINGS ───────────────────────────────────────────────────────
+
+  async getPaymentSettings(): Promise<PaymentSettings> {
+    if (sbOk()) { const v = await sbGetSetting<PaymentSettings>('paymentSettings'); if (v) { store.paymentSettings = v; setLocal('qf_paymentSettings', v); return v; } }
+    if (fbOk()) { try { const snap = await getDoc(doc(getDb()!, 'settings', 'paymentSettings')); if (snap.exists()) { const v = snap.data() as PaymentSettings; store.paymentSettings = v; setLocal('qf_paymentSettings', v); return v; } } catch (err) { console.warn('[db] Firebase getPayment fallback:', err); } }
+    return store.paymentSettings;
+  },
+
+  async savePaymentSettings(settings: PaymentSettings): Promise<void> {
+    store.paymentSettings = settings;
+    setLocal('qf_paymentSettings', settings);
+    if (sbOk()) { await sbSetSetting('paymentSettings', settings); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'paymentSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/paymentSettings'); } }
+  },
+
+  // ── ADMIN SETTINGS ─────────────────────────────────────────────────────────
+
+  async getAdminSettings(): Promise<AdminCredentials> {
+    if (sbOk()) { const v = await sbGetSetting<AdminCredentials>('adminSettings'); if (v) { store.adminSettings = v; setLocal('qf_adminSettings', v); return v; } }
+    if (fbOk()) { try { const snap = await getDoc(doc(getDb()!, 'settings', 'adminSettings')); if (snap.exists()) { const v = snap.data() as AdminCredentials; store.adminSettings = v; setLocal('qf_adminSettings', v); return v; } } catch (err) { console.warn('[db] Firebase getAdmin fallback:', err); } }
+    return store.adminSettings;
+  },
+
+  async saveAdminSettings(settings: AdminCredentials): Promise<void> {
+    store.adminSettings = settings;
+    setLocal('qf_adminSettings', settings);
+    if (sbOk()) { await sbSetSetting('adminSettings', settings); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'adminSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/adminSettings'); } }
+  },
+
+  // ── SUPPORT SETTINGS ───────────────────────────────────────────────────────
+
+  async getSupportSettings(): Promise<SupportSettings> {
+    if (sbOk()) { const v = await sbGetSetting<SupportSettings>('supportSettings'); if (v) { store.supportSettings = v; setLocal('qf_supportSettings', v); return v; } }
+    if (fbOk()) { try { const snap = await getDoc(doc(getDb()!, 'settings', 'supportSettings')); if (snap.exists()) { const v = snap.data() as SupportSettings; store.supportSettings = v; setLocal('qf_supportSettings', v); return v; } } catch (err) { console.warn('[db] Firebase getSupport fallback:', err); } }
+    return store.supportSettings;
+  },
+
+  async saveSupportSettings(settings: SupportSettings): Promise<void> {
+    store.supportSettings = settings;
+    setLocal('qf_supportSettings', settings);
+    if (sbOk()) { await sbSetSetting('supportSettings', settings); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'supportSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/supportSettings'); } }
+  },
+
+  // ── SMS SETTINGS ───────────────────────────────────────────────────────────
+
+  async getSMSSettings(): Promise<SMSSettings> {
+    if (sbOk()) { const v = await sbGetSetting<SMSSettings>('smsSettings'); if (v) { setLocal('qf_smsSettings', v); return v; } }
+    if (fbOk()) { try { const snap = await getDoc(doc(getDb()!, 'settings', 'smsSettings')); if (snap.exists()) { const v = snap.data() as SMSSettings; setLocal('qf_smsSettings', v); return v; } } catch (err) { console.warn('[db] Firebase getSMS fallback:', err); } }
+    return getLocal<SMSSettings>('qf_smsSettings', DEFAULT_SMS_SETTINGS);
+  },
+
+  async saveSMSSettings(settings: SMSSettings): Promise<void> {
+    setLocal('qf_smsSettings', settings);
+    if (sbOk()) { await sbSetSetting('smsSettings', settings); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'smsSettings'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/smsSettings'); } }
+  },
+
+  // ── EMAIL VERIFICATION SETTINGS ────────────────────────────────────────────
+
+  async getEmailVerificationSettings(): Promise<EmailVerificationSettings> {
+    if (sbOk()) { const v = await sbGetSetting<EmailVerificationSettings>('emailVerification'); if (v) { setLocal('qf_emailVerification', v); return v; } }
+    if (fbOk()) { try { const snap = await getDoc(doc(getDb()!, 'settings', 'emailVerification')); if (snap.exists()) { const v = snap.data() as EmailVerificationSettings; setLocal('qf_emailVerification', v); return v; } } catch (err) { console.warn('[db] Firebase getEmailVerif fallback:', err); } }
+    return getLocal<EmailVerificationSettings>('qf_emailVerification', DEFAULT_EMAIL_VERIFICATION_SETTINGS);
+  },
+
+  async saveEmailVerificationSettings(settings: EmailVerificationSettings): Promise<void> {
+    setLocal('qf_emailVerification', settings);
+    if (sbOk()) { await sbSetSetting('emailVerification', settings); return; }
+    if (fbOk()) { try { await setDoc(doc(getDb()!, 'settings', 'emailVerification'), settings); } catch (e) { handleFirestoreError(e, OperationType.WRITE, 'settings/emailVerification'); } }
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  USER PROFILES — Firestore-backed, localStorage as fast cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+const USER_PROFILES_KEY = 'qf_user_profiles';
+const CURRENT_USER_KEY  = 'qf_current_user';
+
+export function getUserProfiles(): Record<string, import('./types').UserProfile> {
+  try { const d = localStorage.getItem(USER_PROFILES_KEY); return d ? JSON.parse(d) : {}; }
+  catch { return {}; }
+}
+
+/** Write a profile to localStorage cache. */
+export function saveUserProfile(profile: import('./types').UserProfile): void {
+  const profiles = getUserProfiles();
+  profiles[profile.email.toLowerCase()] = profile;
+  localStorage.setItem(USER_PROFILES_KEY, JSON.stringify(profiles));
+}
+
+export function getCurrentUserProfile(): import('./types').UserProfile | null {
+  try {
+    const email = localStorage.getItem(CURRENT_USER_KEY);
+    if (!email) return null;
+    return getUserProfiles()[email] || null;
+  } catch { return null; }
+}
+
+export function setCurrentUserSession(email: string | null): void {
+  if (email) { localStorage.setItem(CURRENT_USER_KEY, email.toLowerCase()); }
+  else { localStorage.removeItem(CURRENT_USER_KEY); }
+}
+
+/**
+ * Write a customer UserProfile to Firestore users/{profile.id}.
+ * Also updates the localStorage cache.
+ * No-ops silently if Firebase is not configured.
+ */
+export async function saveUserToFirestore(profile: import('./types').UserProfile): Promise<void> {
+  // Always update localStorage cache
+  saveUserProfile(profile);
+  if (!fbOk()) return;
+  try {
+    await setDoc(doc(getDb()!, 'users', profile.id), profile);
+  } catch (e) {
+    console.warn('[db] saveUserToFirestore failed:', e);
+  }
+}
+
+/**
+ * Read a customer UserProfile from Firestore by document ID.
+ * Returns null if not found or Firebase unavailable.
+ */
+export async function getUserFromFirestore(id: string): Promise<import('./types').UserProfile | null> {
+  if (!fbOk()) return null;
+  try {
+    const snap = await getDoc(doc(getDb()!, 'users', id));
+    if (snap.exists()) return snap.data() as import('./types').UserProfile;
+    return null;
+  } catch (e) {
+    console.warn('[db] getUserFromFirestore failed:', e);
+    return null;
+  }
+}
+
+/**
+ * Query Firestore users collection by email field.
+ * Returns null if not found or Firebase unavailable.
+ */
+export async function getUserByEmailFromFirestore(email: string): Promise<import('./types').UserProfile | null> {
+  if (!fbOk()) return null;
+  try {
+    const q = query(collection(getDb()!, 'users'), where('email', '==', email.toLowerCase()));
+    const snap = await getDocs(q);
+    if (!snap.empty) {
+      const d = snap.docs[0];
+      return { id: d.id, ...d.data() } as import('./types').UserProfile;
+    }
+    return null;
+  } catch (e) {
+    console.warn('[db] getUserByEmailFromFirestore failed:', e);
+    return null;
+  }
+}
+
+export function simpleHash(str: string): string {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return hash.toString(36);
+}
+
+// Re-export status checkers for convenience
+export { getIsFirebaseConfigured as isFirebaseConfigured };
+export { getIsSupabaseConfigured as isSupabaseConfigured };
