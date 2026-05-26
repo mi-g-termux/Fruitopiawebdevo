@@ -1295,6 +1295,18 @@ setProducts([...products]);
             console.warn('[Auth] Firebase Auth sign-in failed — Firestore writes will be rejected. Error:', e1?.code ?? e1);
           }
         }
+
+        // ── Refresh adminSettings now that the Firebase Auth token is ready ──
+        // The initial loadData() call may have hit PERMISSION_DENIED before
+        // sign-in completed and returned the default credentials. Re-read so
+        // the "Current Saved Credentials" panel reflects the real Firestore
+        // value (including any password the admin has changed previously).
+        try {
+          const fresh = await dbService.getAdminSettings();
+          if (fresh?.username && fresh?.password) setAdminSettings(fresh);
+        } catch (err) {
+          console.warn('[AppContext] post-login getAdminSettings refresh failed:', err);
+        }
       }
     } else {
       // ── C2: Firebase Auth sign-out — awaited for clean token clearing ───

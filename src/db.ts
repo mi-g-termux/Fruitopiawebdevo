@@ -440,7 +440,10 @@ const store = {
   siteSettings:  { ...DEFAULT_SITE_SETTINGS, ...getLocal<Partial<SiteSettings>>('qf_siteSettings', {}) } as SiteSettings,
   smtpSettings:  getLocal<SMTPSettings>('qf_smtpSettings',     DEFAULT_SMTP_SETTINGS),
   paymentSettings: getLocal<PaymentSettings>('qf_paymentSettings', DEFAULT_PAYMENT_SETTINGS),
-  adminSettings: DEFAULT_ADMIN_CREDENTIALS, // never read from localStorage — Firestore is the only source of truth
+  // Hydrate from localStorage so a fresh page load shows the saved credentials
+  // instantly — Firestore is still the source of truth and overwrites this
+  // value as soon as a successful read completes.
+  adminSettings: getLocal<AdminCredentials>('qf_adminSettings', DEFAULT_ADMIN_CREDENTIALS),
   supportSettings: getLocal<SupportSettings>('qf_supportSettings', DEFAULT_SUPPORT_SETTINGS),
 };
 
@@ -862,12 +865,17 @@ export const dbService = {
   // ── ADMIN SETTINGS ─────────────────────────────────────────────────────────
 
   async getAdminSettings(): Promise<AdminCredentials> {
-    // Firestore is the ONLY source of truth for admin credentials.
-    // No localStorage read — credentials must be consistent across all devices.
+    // Firestore / Supabase is the source of truth, but we mirror the value
+    // into localStorage so the UI never falls back to the install-time
+    // default (admin / admin123) after a successful password change.
     if (sbOk()) {
       try {
         const v = await sbGetSetting<AdminCredentials>('adminSettings');
-        if (v?.username && v?.password) { store.adminSettings = v; return v; }
+        if (v?.username && v?.password) {
+          store.adminSettings = v;
+          setLocal('qf_adminSettings', v);
+          return v;
+        }
       } catch (err) {
         console.warn('[db] Supabase getAdminSettings failed, trying Firebase:', err);
       }
@@ -878,29 +886,34 @@ export const dbService = {
         if (snap.exists()) {
           const v = snap.data() as AdminCredentials;
           store.adminSettings = v;
+          setLocal('qf_adminSettings', v);
           return v;
         }
-        // Document missing — return in-memory value (set by installer)
-        return store.adminSettings;
+        // Document missing — fall through to local cache / in-memory value.
       } catch (err: any) {
         // PERMISSION_DENIED = Firebase Auth token not ready yet.
-        // Return in-memory store so login can still proceed.
+        // Fall through and use the local cache so the UI keeps showing the
+        // real saved credentials instead of the install-time default.
         const code = err?.code ?? '';
         if (code === 'permission-denied' || String(err?.message).includes('PERMISSION_DENIED')) {
-          console.warn('[db] getAdminSettings: Firestore permission denied — Firebase Auth token may not be ready. Using in-memory credentials.');
+          console.warn('[db] getAdminSettings: Firestore permission denied — using cached credentials until auth is ready.');
         } else {
           console.warn('[db] getAdminSettings: Firestore error:', err);
         }
-        return store.adminSettings;
       }
     }
-    // Firebase not yet connected — return in-memory store (set by installer on first boot)
+    // Cloud read unavailable or returned nothing — fall back to the last
+    // value we cached locally (written on every successful save). Only return
+    // the hard-coded default when nothing has ever been saved on this device.
+    const cached = getLocal<AdminCredentials | null>('qf_adminSettings', null);
+    if (cached?.username && cached?.password) {
+      store.adminSettings = cached;
+      return cached;
+    }
     return store.adminSettings;
   },
 
   async saveAdminSettings(settings: AdminCredentials): Promise<void> {
-    // Write to Firestore ONLY — no localStorage.
-    // This makes the change effective immediately on every device worldwide.
     if (sbOk()) {
       await sbSetSetting('adminSettings', settings);
     } else if (fbOk()) {
@@ -909,8 +922,10 @@ export const dbService = {
       throw new Error('No database connected. Firebase must be configured to save admin credentials.');
     }
     store.adminSettings = settings;
-    // Remove any stale localStorage copy left by old versions
-    try { localStorage.removeItem('qf_adminSettings'); } catch { /* ignore */ }
+    // Mirror to localStorage so a reload (or a read that hits permission-denied
+    // before Firebase Auth is ready) still surfaces the new credentials in the
+    // "Current Saved Credentials" panel instead of the admin/admin123 default.
+    setLocal('qf_adminSettings', settings);
   },
 
   // ── SUPPORT SETTINGS ───────────────────────────────────────────────────────
