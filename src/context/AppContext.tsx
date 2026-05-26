@@ -216,7 +216,7 @@ interface AppContextType {
   removeFromCart: (productId: string) => void;
   updateCartQuantity: (productId: string, quantity: number) => void;
   clearCart: () => void;
-  applyCouponCode: (code: string) => { success: boolean; message: string };
+  applyCouponCode: (code: string) => Promise<{ success: boolean; message: string }>;
   removeCoupon: () => void;
 
   // Admin auth
@@ -1124,8 +1124,21 @@ setProducts([...products]);
   const clearCart    = () => { try { localStorage.removeItem('qf_cart'); } catch {} setCart([]); setAppliedCoupon(null); };
   const removeCoupon = () => { setAppliedCoupon(null); };
 
-  const applyCouponCode = (code: string): { success: boolean; message: string } => {
-    const match = coupons.find(c => c.code.trim().toUpperCase() === code.trim().toUpperCase());
+  const applyCouponCode = async (code: string): Promise<{ success: boolean; message: string }> => {
+    const wanted = code.trim().toUpperCase();
+    // Always refresh from Firebase/DB first so newly-created coupons (added from another
+    // admin session) are visible immediately without requiring a page reload.
+    let pool = coupons;
+    try {
+      const fresh = await dbService.getCoupons();
+      if (Array.isArray(fresh) && fresh.length) {
+        pool = fresh;
+        setCoupons(fresh);
+      }
+    } catch (err) {
+      console.warn('[applyCouponCode] refresh failed, using cached list:', err);
+    }
+    const match = pool.find(c => c.code.trim().toUpperCase() === wanted);
     if (!match) return { success: false, message: 'Invalid coupon code!' };
     if (match.expiryDate < new Date().toISOString().split('T')[0]) return { success: false, message: 'Coupon has expired!' };
     if (match.usedCount >= match.usageLimit) return { success: false, message: 'Coupon usage limit reached!' };
