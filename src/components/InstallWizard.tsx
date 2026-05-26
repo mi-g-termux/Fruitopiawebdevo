@@ -346,21 +346,37 @@ function Step6Install({
 
       {/* Awaiting upload amber notice */}
       {installProgress.status === 'awaiting-upload' && (
-        <div className="bg-amber-50 border-l-4 border-amber-500 text-amber-800 p-4 rounded">
-          <p className="font-semibold text-sm mb-1">⚠️ Manual step required</p>
-          <p className="text-sm mb-3">
-            Upload <strong>firebase-config.json</strong> (just downloaded) to your website
-            root folder, then click Continue.
-          </p>
+        <div className="bg-amber-50 border-l-4 border-amber-500 text-amber-800 p-4 rounded space-y-3">
+          <p className="font-semibold text-sm">⚠️ Manual step required — place the file in TWO locations</p>
+
+          {/* Step 1 */}
+          <div className="bg-white border border-amber-200 rounded-lg p-3 text-sm space-y-1">
+            <p className="font-semibold text-amber-900">📁 Step 1 — Project source folder</p>
+            <p>Replace <code className="bg-amber-100 px-1 rounded font-mono text-xs">public/firebase-config.json</code> in your project with the downloaded file.</p>
+            <p className="text-xs text-amber-700">This is the file that gets bundled when you run <code className="bg-amber-100 px-1 rounded font-mono text-xs">npm run build</code> or deploy via Netlify / Vercel.</p>
+          </div>
+
+          {/* Step 2 */}
+          <div className="bg-white border border-amber-200 rounded-lg p-3 text-sm space-y-1">
+            <p className="font-semibold text-amber-900">🌐 Step 2 — Live web root folder</p>
+            <p>Also upload the same file to your live server's public web folder:</p>
+            <ul className="mt-1 space-y-1 text-xs text-amber-800 list-none">
+              <li>• <strong>cPanel / shared hosting:</strong> upload to <code className="bg-amber-100 px-1 rounded font-mono">public_html/firebase-config.json</code></li>
+              <li>• <strong>Netlify / Vercel:</strong> replace <code className="bg-amber-100 px-1 rounded font-mono">public/firebase-config.json</code> in your repo and redeploy</li>
+              <li>• <strong>VPS / custom server:</strong> upload to your web root, e.g. <code className="bg-amber-100 px-1 rounded font-mono">/var/www/html/firebase-config.json</code></li>
+            </ul>
+            <p className="text-xs text-amber-700 mt-1">✅ Verify it works by opening <code className="bg-amber-100 px-1 rounded font-mono text-xs">yoursite.com/firebase-config.json</code> in your browser — you should see your credentials.</p>
+          </div>
+
           <button
-            className="bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-semibold px-5 py-2 rounded-lg transition-colors duration-150"
+            className="bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-semibold px-5 py-2 rounded-lg transition-colors duration-150 w-full"
             onClick={async () => {
               markDone(2)
               setInstallProgress(p => ({ ...p, status: 'running' }))
               await runInstallFromStep3()
             }}
           >
-            ✅ I've uploaded it, Continue →
+            ✅ Done — I've placed the file in both locations, Continue →
           </button>
         </div>
       )}

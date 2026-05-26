@@ -31,10 +31,15 @@ function respond(bool $success, string $message, int $httpCode = 200): void {
     exit;
 }
 
-// ── File paths (same directory as this script) ───────────────────────────────
-$scriptDir   = __DIR__;
-$configFile  = $scriptDir . DIRECTORY_SEPARATOR . 'firebase-config.json';
-$lockFile    = $scriptDir . DIRECTORY_SEPARATOR . 'install-helper.lock';
+// ── File paths ───────────────────────────────────────────────────────────────
+// This script lives in public/ (the web root served to browsers).
+// firebase-config.json MUST be in public/ so browsers can fetch it at /firebase-config.json.
+// We also try to write a copy one level up (project root) for local/Vite dev environments.
+$scriptDir    = __DIR__;                        // public/  <- primary location
+$projectRoot  = dirname($scriptDir);            // project root <- secondary copy
+$configFile   = $scriptDir   . DIRECTORY_SEPARATOR . 'firebase-config.json';
+$configFileUp = $projectRoot . DIRECTORY_SEPARATOR . 'firebase-config.json';
+$lockFile     = $scriptDir   . DIRECTORY_SEPARATOR . 'install-helper.lock';
 
 // ── Lock check — if already installed, refuse ────────────────────────────────
 if (file_exists($lockFile)) {
@@ -88,7 +93,7 @@ if (isset($data['databaseId']) && is_string($data['databaseId']) && trim($data['
     $configData['databaseId'] = trim($data['databaseId']);
 }
 
-// ── Write firebase-config.json ───────────────────────────────────────────────
+// ── Write firebase-config.json to public/ (primary — required) ──────────────
 $jsonOutput = json_encode($configData, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
 if ($jsonOutput === false) {
@@ -100,11 +105,15 @@ $writeResult = file_put_contents($configFile, $jsonOutput, LOCK_EX);
 if ($writeResult === false) {
     respond(
         false,
-        'Failed to write firebase-config.json. Check that the web server has write permission to the public_html directory. ' .
+        'Failed to write firebase-config.json to public/. Check that the web server has write permission to the public_html directory. ' .
         'On cPanel: File Manager → public_html → right-click → Change Permissions → set to 755.',
         500
     );
 }
+
+// ── Also write a copy to project root (secondary — best-effort) ──────────────
+// Silently ignored if the directory is not writable (e.g. on locked shared hosts).
+@file_put_contents($configFileUp, $jsonOutput, LOCK_EX);
 
 // ── Write lock file to prevent re-running ────────────────────────────────────
 $lockContent = json_encode([
@@ -116,4 +125,4 @@ $lockContent = json_encode([
 file_put_contents($lockFile, $lockContent, LOCK_EX);
 
 // ── Success ──────────────────────────────────────────────────────────────────
-respond(true, 'Firebase configuration saved successfully. firebase-config.json written to server root.');
+respond(true, 'Firebase configuration saved successfully. firebase-config.json written to public/ (and project root if writable).');

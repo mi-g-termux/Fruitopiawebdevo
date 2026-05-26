@@ -1,5 +1,7 @@
 {
-
+"_readme": "This file is written automatically by the Fruitopia install wizard.",
+  "_readme2": "Visit yoursite.com/install to run setup. Do NOT edit manually.",
+  "_readme3": "IMPORTANT: This file must live in your public web folder (public_html on cPanel, public/ on Vite) so the browser can reach it at /firebase-config.json.",
   "apiKey": "AIzaSyCIIZElZtYHF-Qac7PXk1RCT-frHjJ1tj4",
   "authDomain": "fruitopiawebs.firebaseapp.com",
   "projectId": "fruitopiawebs",
