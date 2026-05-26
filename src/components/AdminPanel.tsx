@@ -428,6 +428,12 @@ export const AdminPanel: React.FC = () => {
  const [secUsername, setSecUsername] = useState(adminSettings.username ||'');
  const [secPass, setSecPass] = useState(adminSettings.password ||'');
 
+ // Keep inputs in sync when adminSettings loads/changes (e.g. after Firestore fetch)
+ useEffect(() => {
+   setSecUsername(adminSettings.username || '');
+   setSecPass(adminSettings.password || '');
+ }, [adminSettings.username, adminSettings.password]);
+
  // --- GOOGLE SIGN-IN SETTINGS ---
  const [googleSignInEnabled, setGoogleSignInEnabled] = useState(adminSettings.googleSignInEnabled ?? false);
  const [googleClientId, setGoogleClientId] = useState(adminSettings.googleClientId ||'');
@@ -2352,7 +2358,7 @@ await saveSiteSettings(JSON.parse(JSON.stringify(current)));
  type="text"
  value={secUsername}
  onChange={(e) => setSecUsername(e.target.value)}
- className="w-full bg-slate-50 border border-slate-200 focus:border-rose-400 focus:ring-1 focus:ring-rose-400 rounded-lg px-2.5 py-1.5 text-xs font-semibold uppercase text-rose-600 transition-all outline-none"
+ className="w-full bg-slate-50 border border-slate-200 focus:border-rose-400 focus:ring-1 focus:ring-rose-400 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 transition-all outline-none"
  /> </div> <div> <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">New Administrator Password</label> <input
  type="password"
  value={secPass}
