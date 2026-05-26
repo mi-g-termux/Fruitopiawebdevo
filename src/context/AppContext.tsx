@@ -105,7 +105,7 @@ import {
   onFirebaseReadyChange,
   getIsFirebaseConfigured,
   FirebaseRuntimeConfig,
-  getAuth,
+  auth,
   getDb,
 } from '../firebase';
 import {
@@ -266,7 +266,18 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
   const [reviews, setReviews]           = useState<Review[]>([]);
   const [smtpSettings, setSmtpSettings] = useState<SMTPSettings | null>(null);
   const [paymentSettings, setPaymentSettings] = useState<PaymentSettings | null>(null);
-  const [adminSettings, setAdminSettings]     = useState<AdminCredentials | null>(null);
+  const [adminSettings, setAdminSettings]     = useState<AdminCredentials>(() => {
+    // Hydrate immediately from localStorage so the login form never falls back
+    // to DEFAULT_ADMIN_CREDENTIALS while loadData() is still in flight.
+    try {
+      const raw = localStorage.getItem('qf_adminSettings');
+      if (raw) {
+        const parsed: AdminCredentials = JSON.parse(raw);
+        if (parsed?.username && parsed?.password) return parsed;
+      }
+    } catch { /* ignore */ }
+    return DEFAULT_ADMIN_CREDENTIALS;
+  });
   const [supportSettings, setSupportSettings] = useState<SupportSettings | null>(null);
   const [smsSettings, setSMSSettings]         = useState<SMSSettings | null>(null);
   const [emailVerificationSettings, setEmailVerificationSettings] = useState<EmailVerificationSettings | null>(null);
@@ -523,24 +534,12 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
 
   // Mount: initial data load + attach listeners for the persisted engine
   useEffect(() => {
-    // Clear stale admin credentials from localStorage so Firestore is always source of truth
-    try { localStorage.removeItem('qf_adminSettings'); } catch {}
     loadData();
     // Attach listeners for whatever engine was persisted at startup
     const engine = getActiveEngine();
     if (engine !== 'local') {
       _mountListenersForEngine(engine);
     }
-
-    // Cross-tab credential sync: when admin changes password in one tab,
-    // all other open tabs reload admin settings from Firestore immediately
-    const handleStorageEvent = (e: StorageEvent) => {
-      if (e.key === 'qf_admin_cred_updated') {
-        dbService.getAdminSettings().then(setAdminSettings).catch(() => {});
-      }
-    };
-    window.addEventListener('storage', handleStorageEvent);
-    return () => window.removeEventListener('storage', handleStorageEvent);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1042,15 +1041,7 @@ setProducts([...products]);
 
   const saveSMTPSettings              = async (s: SMTPSettings)              => { await dbService.saveSMTPSettings(s);              setSmtpSettings(s); };
   const savePaymentSettings           = async (s: PaymentSettings)           => { await dbService.savePaymentSettings(s);           setPaymentSettings(s); };
-  const saveAdminSettings = async (s: AdminCredentials) => {
-    await dbService.saveAdminSettings(s);
-    setAdminSettings(s);
-    // Broadcast credential change to all open tabs via storage event
-    try {
-      localStorage.setItem('qf_adminSettings', JSON.stringify(s));
-      localStorage.setItem('qf_admin_cred_updated', Date.now().toString());
-    } catch {}
-  };
+  const saveAdminSettings             = async (s: AdminCredentials)          => { await dbService.saveAdminSettings(s);             setAdminSettings(s); };
   const saveSupportSettings           = async (s: SupportSettings)           => { await dbService.saveSupportSettings(s);           setSupportSettings(s); triggerTawkToLoader(); };
   const saveSMSSettings               = async (s: SMSSettings)               => { await dbService.saveSMSSettings(s);               setSMSSettings(s); };
   const saveEmailVerificationSettings = async (s: EmailVerificationSettings) => { await dbService.saveEmailVerificationSettings(s); setEmailVerificationSettings(s); };
@@ -1201,11 +1192,11 @@ setProducts([...products]);
    * C2 LOGOUT: fbSignOut clears the Firebase Auth token server-side before
    * the local session is cleared.
    */
-  const setAdminLoggedIn = async (
+  const setAdminLoggedIn = (
     loggedIn: boolean,
     username?: string,
     password?: string,
-  ): Promise<void> => {
+  ) => {
     if (loggedIn) {
       // ── Persist local session ──────────────────────────────────────────
       setIsAdminLoggedIn(true);
@@ -1215,54 +1206,59 @@ setProducts([...products]);
       };
       try { localStorage.setItem('qf_admin_session', JSON.stringify(session)); } catch {}
 
-      // ── C1: Firebase Auth sign-in — AWAITED so Firestore writes work immediately ──
-      const authInstance = getAuth();
-      if (username && password && authInstance) {
+      // ── C1: Firebase Auth sign-in (best-effort, non-blocking) ──────────
+      if (username && password && auth) {
         const adminEmail = username.trim() + '@fruitopia-admin.internal';
 
         // Stable password derived from username only — never changes when the
         // admin updates their local password, so Firebase Auth stays in sync.
         const stablePassword = 'ftp_' + btoa(adminEmail).replace(/[^a-zA-Z0-9]/g, '') + '_auth';
 
-        try {
-          // ── Path 1: happy path ─────────────────────────────────────
-          await signInWithEmailAndPassword(authInstance, adminEmail, stablePassword);
-        } catch (e1: any) {
+        (async () => {
+          try {
+            // ── Path 1: happy path ─────────────────────────────────────
+            await signInWithEmailAndPassword(auth, adminEmail, stablePassword);
+          } catch (e1: any) {
 
-          if (e1?.code === 'auth/user-not-found' || e1?.code === 'auth/invalid-credential') {
-            // ── Path 2: first login ever — create the Firebase Auth user ──
-            try {
-              await createUserWithEmailAndPassword(authInstance, adminEmail, stablePassword);
-            } catch (e2: any) {
-              console.warn('[Auth] Firebase Auth user creation failed:', e2?.code ?? e2);
-            }
+            if (e1?.code === 'auth/user-not-found' || e1?.code === 'auth/invalid-credential') {
+              // ── Path 2: first login ever — create the Firebase Auth user ──
+              try {
+                await createUserWithEmailAndPassword(auth, adminEmail, stablePassword);
+              } catch (e2: any) {
+                console.warn('[Auth] Firebase Auth user creation failed:', e2?.code ?? e2);
+              }
 
-          } else if (e1?.code === 'auth/wrong-password') {
-            // ── Path 3: migration — sign in with old password then update ──
-            try {
-              const cred = await signInWithEmailAndPassword(authInstance, adminEmail, password);
-              await updatePassword(cred.user, stablePassword);
-            } catch (e3: any) {
+            } else if (e1?.code === 'auth/wrong-password') {
+              // ── Path 3: migration — user was created with the raw admin
+              //    password (old behaviour). Sign in with that, then
+              //    immediately update to the stable password so future
+              //    logins take Path 1.  ─────────────────────────────────
+              try {
+                const cred = await signInWithEmailAndPassword(auth, adminEmail, password);
+                await updatePassword(cred.user, stablePassword);
+              } catch (e3: any) {
+                console.warn(
+                  '[Auth] Firebase Auth migration failed — Firestore writes may be rejected.',
+                  'code:', e3?.code ?? e3,
+                );
+              }
+
+            } else {
+              // ── Path 4: unexpected error ───────────────────────────────
               console.warn(
-                '[Auth] Firebase Auth migration failed — Firestore writes may be rejected.',
-                'code:', e3?.code ?? e3,
+                '[Auth] Firebase Auth sign-in failed — Firestore writes will be rejected ' +
+                'until this is resolved. Error:', e1?.code ?? e1,
               );
             }
-
-          } else {
-            // ── Path 4: unexpected error ───────────────────────────────
-            console.warn(
-              '[Auth] Firebase Auth sign-in failed — Firestore writes will be rejected ' +
-              'until this is resolved. Error:', e1?.code ?? e1,
-            );
           }
-        }
+        })();
       }
     } else {
-      // ── C2: Firebase Auth sign-out ─────────────────────────────────────
-      const authInstance = getAuth();
-      if (authInstance) {
-        try { await fbSignOut(authInstance); } catch { /* silent */ }
+      // ── C2: Firebase Auth sign-out (best-effort, non-blocking) ─────────
+      if (auth) {
+        (async () => {
+          try { await fbSignOut(auth); } catch { /* silent */ }
+        })();
       }
 
       // ── Clear local session ────────────────────────────────────────────
@@ -1287,7 +1283,7 @@ setProducts([...products]);
         siteSettings:              siteSettings || DEFAULT_SITE_SETTINGS,
         smtpSettings:              smtpSettings || DEFAULT_SMTP_SETTINGS,
         paymentSettings:           paymentSettings || DEFAULT_PAYMENT_SETTINGS,
-        adminSettings:             adminSettings || DEFAULT_ADMIN_CREDENTIALS,
+        adminSettings:             adminSettings,
         supportSettings:           supportSettings || DEFAULT_SUPPORT_SETTINGS,
         smsSettings:               smsSettings || DEFAULT_SMS_SETTINGS,
         emailVerificationSettings: emailVerificationSettings || DEFAULT_EMAIL_VERIFICATION_SETTINGS,
