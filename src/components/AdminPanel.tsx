@@ -50,6 +50,8 @@ export const AdminPanel: React.FC = () => {
  adminSettings,
  supportSettings,
  isAdminLoggedIn,
+ isFirebaseReady,
+ isLoading,
 
  addProduct,
  editProduct,
@@ -438,25 +440,44 @@ export const AdminPanel: React.FC = () => {
  const [googleSignInEnabled, setGoogleSignInEnabled] = useState(adminSettings.googleSignInEnabled ?? false);
  const [googleClientId, setGoogleClientId] = useState(adminSettings.googleClientId ||'');
 
+ const [loginLoading, setLoginLoading] = useState(false);
+
  const handleAdminVerify = async (e: React.FormEvent) => {
  e.preventDefault();
  setLoginError('');
  setLoginSuccess('');
+ if (loginLoading) return;
+
+ // Firebase must be connected — credentials live only in Firestore
+ if (!isFirebaseReady) {
+   setLoginError('Firebase is not connected. Check your Firebase configuration.');
+   return;
+ }
+
+ setLoginLoading(true);
  try {
-   // Always fetch live credentials from Firestore — never trust cached state
+   // Always fetch live credentials directly from Firestore.
+   // This works identically from any device anywhere in the world.
    const liveSettings = await dbService.getAdminSettings();
    if (
      usernameInput.trim() === liveSettings.username &&
      passwordInput.trim() === liveSettings.password
    ) {
-     setLoginSuccess('Access granted! Loading Store Admin...');
-     // Await Firebase Auth so Firestore writes work immediately after login
+     setLoginSuccess('Access granted! Signing in...');
+     // IMPORTANT: await this — Firebase Auth token must be ready BEFORE
+     // the panel opens, otherwise every Firestore write gets PERMISSION_DENIED.
      await setAdminLoggedIn(true, usernameInput.trim(), passwordInput.trim());
    } else {
      setLoginError('Invalid credentials. Please check your username and password.');
    }
- } catch {
-   setLoginError('Could not verify credentials. Check your connection and try again.');
+ } catch (err: any) {
+   if (err?.code === 'permission-denied' || err?.message?.includes('permission')) {
+     setLoginError('Firestore permission denied. Check your Firestore security rules.');
+   } else {
+     setLoginError('Could not reach the database. Check your internet connection and try again.');
+   }
+ } finally {
+   setLoginLoading(false);
  }
  };
 
@@ -1098,8 +1119,9 @@ await saveSiteSettings(JSON.parse(JSON.stringify(current)));
  /> </div> <div className="pt-1"> <button
  type="submit"
  className="w-full cursor-pointer py-3.5 font-black uppercase text-sm tracking-wider transition-all rounded-xl shadow-lg text-white flex items-center justify-center gap-2"
- style={{ background:'linear-gradient(135deg, #10b981, #059669)' }}
- > Access Command Center
+ style={{ background: loginLoading ? '#6b7280' : 'linear-gradient(135deg, #10b981, #059669)', cursor: loginLoading ? 'wait' : 'pointer' }}
+ disabled={loginLoading}
+ > {loginLoading ? 'Signing in...' : 'Access Command Center'}
  </button> </div> </form> <a href="/" className="mt-5 block text-center text-xs font-semibold text-white/40 hover:text-white/70 transition-colors uppercase tracking-wide"> ← Back to Storefront
  </a> </div> </div> <p className="text-center text-white/20 text-[10px] mt-6 font-medium uppercase tracking-widest">Protected by Store Admin Security</p> </div> </div> );
  }

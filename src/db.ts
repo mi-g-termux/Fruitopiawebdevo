@@ -440,7 +440,7 @@ const store = {
   siteSettings:  { ...DEFAULT_SITE_SETTINGS, ...getLocal<Partial<SiteSettings>>('qf_siteSettings', {}) } as SiteSettings,
   smtpSettings:  getLocal<SMTPSettings>('qf_smtpSettings',     DEFAULT_SMTP_SETTINGS),
   paymentSettings: getLocal<PaymentSettings>('qf_paymentSettings', DEFAULT_PAYMENT_SETTINGS),
-  adminSettings: getLocal<AdminCredentials>('qf_adminSettings', DEFAULT_ADMIN_CREDENTIALS),
+  adminSettings: DEFAULT_ADMIN_CREDENTIALS, // never read from localStorage — Firestore is the only source of truth
   supportSettings: getLocal<SupportSettings>('qf_supportSettings', DEFAULT_SUPPORT_SETTINGS),
 };
 
@@ -862,44 +862,40 @@ export const dbService = {
   // ── ADMIN SETTINGS ─────────────────────────────────────────────────────────
 
   async getAdminSettings(): Promise<AdminCredentials> {
-    // Always prefer live backend — never blindly serve stale localStorage defaults
+    // Firestore is the ONLY source of truth for admin credentials.
+    // No localStorage read — credentials must be consistent across all devices.
     if (sbOk()) {
       const v = await sbGetSetting<AdminCredentials>('adminSettings');
-      if (v) { store.adminSettings = v; setLocal('qf_adminSettings', v); return v; }
+      if (v?.username && v?.password) { store.adminSettings = v; return v; }
     }
     if (fbOk()) {
-      try {
-        const snap = await getDoc(doc(getDb()!, 'settings', 'adminSettings'));
-        if (snap.exists()) {
-          const v = snap.data() as AdminCredentials;
-          store.adminSettings = v;
-          setLocal('qf_adminSettings', v);
-          return v;
-        }
-      } catch (err) { console.warn('[db] Firebase getAdmin fallback:', err); }
+      // throws on network/permission error — caller must handle and show UI error
+      const snap = await getDoc(doc(getDb()!, 'settings', 'adminSettings'));
+      if (snap.exists()) {
+        const v = snap.data() as AdminCredentials;
+        store.adminSettings = v;
+        return v;
+      }
+      // Document missing — return in-memory value (set by installer)
+      return store.adminSettings;
     }
-    // Only use localStorage cache if it has real (non-default) credentials
-    const cached = store.adminSettings;
-    if (cached && cached.username && cached.username !== DEFAULT_ADMIN_CREDENTIALS.username) {
-      return cached;
-    }
-    // Clear stale default so it doesn't poison future checks
-    try { localStorage.removeItem('qf_adminSettings'); } catch {}
-    store.adminSettings = DEFAULT_ADMIN_CREDENTIALS;
-    return DEFAULT_ADMIN_CREDENTIALS;
+    // Firebase not yet connected — return in-memory store (set by installer on first boot)
+    return store.adminSettings;
   },
 
   async saveAdminSettings(settings: AdminCredentials): Promise<void> {
-    // Write to backend FIRST — if it throws, local state stays unchanged
+    // Write to Firestore ONLY — no localStorage.
+    // This makes the change effective immediately on every device worldwide.
     if (sbOk()) {
       await sbSetSetting('adminSettings', settings);
     } else if (fbOk()) {
-      // Allow the real Firestore error to propagate to the caller
       await setDoc(doc(getDb()!, 'settings', 'adminSettings'), settings);
+    } else {
+      throw new Error('No database connected. Firebase must be configured to save admin credentials.');
     }
-    // Only update local state after backend confirms success
     store.adminSettings = settings;
-    setLocal('qf_adminSettings', settings);
+    // Remove any stale localStorage copy left by old versions
+    try { localStorage.removeItem('qf_adminSettings'); } catch { /* ignore */ }
   },
 
   // ── SUPPORT SETTINGS ───────────────────────────────────────────────────────

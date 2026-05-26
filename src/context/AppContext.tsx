@@ -220,7 +220,7 @@ interface AppContextType {
   removeCoupon: () => void;
 
   // Admin auth
-  setAdminLoggedIn: (loggedIn: boolean) => void;
+  setAdminLoggedIn: (loggedIn: boolean, username?: string, password?: string) => Promise<void>;
   triggerTawkToLoader: () => void;
 
   // User state
@@ -266,18 +266,9 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
   const [reviews, setReviews]           = useState<Review[]>([]);
   const [smtpSettings, setSmtpSettings] = useState<SMTPSettings | null>(null);
   const [paymentSettings, setPaymentSettings] = useState<PaymentSettings | null>(null);
-  const [adminSettings, setAdminSettings]     = useState<AdminCredentials>(() => {
-    // Hydrate immediately from localStorage so the login form never falls back
-    // to DEFAULT_ADMIN_CREDENTIALS while loadData() is still in flight.
-    try {
-      const raw = localStorage.getItem('qf_adminSettings');
-      if (raw) {
-        const parsed: AdminCredentials = JSON.parse(raw);
-        if (parsed?.username && parsed?.password) return parsed;
-      }
-    } catch { /* ignore */ }
-    return DEFAULT_ADMIN_CREDENTIALS;
-  });
+  // Admin credentials are NEVER read from localStorage — Firestore is the only
+  // source of truth so changes take effect on every device immediately.
+  const [adminSettings, setAdminSettings] = useState<AdminCredentials | null>(null);
   const [supportSettings, setSupportSettings] = useState<SupportSettings | null>(null);
   const [smsSettings, setSMSSettings]         = useState<SMSSettings | null>(null);
   const [emailVerificationSettings, setEmailVerificationSettings] = useState<EmailVerificationSettings | null>(null);
@@ -534,6 +525,9 @@ export const AppProvider = ({ children }: { children: React.ReactNode }) => {
 
   // Mount: initial data load + attach listeners for the persisted engine
   useEffect(() => {
+    // Clean up any stale admin credentials that old code versions wrote to
+    // localStorage. Credentials now live only in Firestore.
+    try { localStorage.removeItem('qf_adminSettings'); } catch { /* ignore */ }
     loadData();
     // Attach listeners for whatever engine was persisted at startup
     const engine = getActiveEngine();
@@ -1192,76 +1186,55 @@ setProducts([...products]);
    * C2 LOGOUT: fbSignOut clears the Firebase Auth token server-side before
    * the local session is cleared.
    */
-  const setAdminLoggedIn = (
+  const setAdminLoggedIn = async (
     loggedIn: boolean,
     username?: string,
     password?: string,
-  ) => {
+  ): Promise<void> => {
     if (loggedIn) {
-      // ── Persist local session ──────────────────────────────────────────
+      // ── C1: Firebase Auth sign-in FIRST — must complete before panel opens ──
+      // Firestore rules require isAdmin() (valid Firebase Auth token with
+      // @fruitopia-admin.internal email). If we open the panel before the token
+      // is ready, every write (save settings, change password, etc.) gets
+      // PERMISSION_DENIED.
+      if (username && auth) {
+        const adminEmail = username.trim() + '@fruitopia-admin.internal';
+        const stablePassword = 'ftp_' + btoa(adminEmail).replace(/[^a-zA-Z0-9]/g, '') + '_auth';
+        try {
+          await signInWithEmailAndPassword(auth, adminEmail, stablePassword);
+        } catch (e1: any) {
+          if (e1?.code === 'auth/user-not-found' || e1?.code === 'auth/invalid-credential') {
+            // First login ever — create the Firebase Auth user
+            try {
+              await createUserWithEmailAndPassword(auth, adminEmail, stablePassword);
+            } catch (e2: any) {
+              console.warn('[Auth] Firebase Auth user creation failed:', e2?.code ?? e2);
+            }
+          } else if (e1?.code === 'auth/wrong-password') {
+            // Migration: old user created with raw password — update to stable
+            try {
+              const cred = await signInWithEmailAndPassword(auth, adminEmail, password ?? '');
+              await updatePassword(cred.user, stablePassword);
+            } catch (e3: any) {
+              console.warn('[Auth] Firebase Auth migration failed:', e3?.code ?? e3);
+            }
+          } else {
+            console.warn('[Auth] Firebase Auth sign-in failed:', e1?.code ?? e1);
+          }
+        }
+      }
+      // ── Persist local session (only AFTER Firebase Auth is ready) ─────────
       setIsAdminLoggedIn(true);
       const session = {
         token: Math.random().toString(36).substr(2),
         expiresAt: Date.now() + 24 * 60 * 60 * 1000,
       };
       try { localStorage.setItem('qf_admin_session', JSON.stringify(session)); } catch {}
-
-      // ── C1: Firebase Auth sign-in (best-effort, non-blocking) ──────────
-      if (username && password && auth) {
-        const adminEmail = username.trim() + '@fruitopia-admin.internal';
-
-        // Stable password derived from username only — never changes when the
-        // admin updates their local password, so Firebase Auth stays in sync.
-        const stablePassword = 'ftp_' + btoa(adminEmail).replace(/[^a-zA-Z0-9]/g, '') + '_auth';
-
-        (async () => {
-          try {
-            // ── Path 1: happy path ─────────────────────────────────────
-            await signInWithEmailAndPassword(auth, adminEmail, stablePassword);
-          } catch (e1: any) {
-
-            if (e1?.code === 'auth/user-not-found' || e1?.code === 'auth/invalid-credential') {
-              // ── Path 2: first login ever — create the Firebase Auth user ──
-              try {
-                await createUserWithEmailAndPassword(auth, adminEmail, stablePassword);
-              } catch (e2: any) {
-                console.warn('[Auth] Firebase Auth user creation failed:', e2?.code ?? e2);
-              }
-
-            } else if (e1?.code === 'auth/wrong-password') {
-              // ── Path 3: migration — user was created with the raw admin
-              //    password (old behaviour). Sign in with that, then
-              //    immediately update to the stable password so future
-              //    logins take Path 1.  ─────────────────────────────────
-              try {
-                const cred = await signInWithEmailAndPassword(auth, adminEmail, password);
-                await updatePassword(cred.user, stablePassword);
-              } catch (e3: any) {
-                console.warn(
-                  '[Auth] Firebase Auth migration failed — Firestore writes may be rejected.',
-                  'code:', e3?.code ?? e3,
-                );
-              }
-
-            } else {
-              // ── Path 4: unexpected error ───────────────────────────────
-              console.warn(
-                '[Auth] Firebase Auth sign-in failed — Firestore writes will be rejected ' +
-                'until this is resolved. Error:', e1?.code ?? e1,
-              );
-            }
-          }
-        })();
-      }
     } else {
-      // ── C2: Firebase Auth sign-out (best-effort, non-blocking) ─────────
+      // ── C2: Firebase Auth sign-out ─────────────────────────────────────────
       if (auth) {
-        (async () => {
-          try { await fbSignOut(auth); } catch { /* silent */ }
-        })();
+        try { await fbSignOut(auth); } catch { /* silent */ }
       }
-
-      // ── Clear local session ────────────────────────────────────────────
       setIsAdminLoggedIn(false);
       try { localStorage.removeItem('qf_admin_session'); } catch {}
     }
@@ -1283,7 +1256,7 @@ setProducts([...products]);
         siteSettings:              siteSettings || DEFAULT_SITE_SETTINGS,
         smtpSettings:              smtpSettings || DEFAULT_SMTP_SETTINGS,
         paymentSettings:           paymentSettings || DEFAULT_PAYMENT_SETTINGS,
-        adminSettings:             adminSettings,
+        adminSettings:             adminSettings ?? DEFAULT_ADMIN_CREDENTIALS,
         supportSettings:           supportSettings || DEFAULT_SUPPORT_SETTINGS,
         smsSettings:               smsSettings || DEFAULT_SMS_SETTINGS,
         emailVerificationSettings: emailVerificationSettings || DEFAULT_EMAIL_VERIFICATION_SETTINGS,
